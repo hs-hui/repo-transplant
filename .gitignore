@@ -1,0 +1,13 @@
+node_modules/
+coverage/
+*.log
+.DS_Store
+.transplant/worktrees/
+evals/targets/
+evals/sources/
+evals/runs/
+evals/prompts/
+# plugin/dist/server.mjs is committed on purpose: the plugin runs it with no install step.
+plugin/dist/*
+!plugin/dist/server.mjs
+!plugin/dist/THIRD_PARTY_LICENSES.md

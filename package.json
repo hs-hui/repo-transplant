@@ -1,0 +1,64 @@
+{
+  "name": "repo-transplant-mcp",
+  "version": "1.0.0",
+  "description": "MCP server and Claude Code plugin that transplants frontend and backend features between repositories with license gates, behavior specs, scope audits and verified evidence.",
+  "type": "module",
+  "license": "MIT",
+  "author": "hs-hui",
+  "homepage": "https://github.com/hs-hui/repo-transplant#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hs-hui/repo-transplant.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hs-hui/repo-transplant/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "claude-code-plugin",
+    "code-migration",
+    "transplant",
+    "refactoring"
+  ],
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "repo-transplant-mcp": "plugin/dist/server.mjs"
+  },
+  "files": [
+    "plugin",
+    "README.md",
+    "README.ko.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check src tests scripts evals plugin/hooks",
+    "format": "biome format --write src tests scripts evals plugin/hooks",
+    "check": "npm run typecheck && npm run lint && npm run test && npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "devDependencies": {
+    "@babel/parser": "^8.0.10",
+    "@biomejs/biome": "^2.6.4",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@types/node": "^26.6.6",
+    "@types/pngjs": "^6.0.5",
+    "@types/semver": "^7.8.0",
+    "esbuild": "^0.28.2",
+    "pixelmatch": "^8.0.0",
+    "pngjs": "^7.0.0",
+    "semver": "^7.8.5",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5",
+    "zod": "^4.6.7"
+  }
+}

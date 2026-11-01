@@ -1,0 +1,16 @@
+{
+  "name": "repo-transplant",
+  "owner": { "name": "hs-hui" },
+  "metadata": {
+    "description": "Transplant features between repositories."
+  },
+  "plugins": [
+    {
+      "name": "repo-transplant",
+      "source": "./plugin",
+      "description": "Transplant frontend and backend features between repositories, adapted to your stack, with license gates, behavior specs, scope audits and verified evidence.",
+      "version": "1.0.0",
+      "license": "MIT"
+    }
+  ]
+}
