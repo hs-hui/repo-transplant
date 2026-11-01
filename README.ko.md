@@ -71,25 +71,21 @@ claude plugin install repo-transplant@repo-transplant
 
 ### MCP 서버만 사용
 
-MCP를 지원하는 모든 클라이언트에서 쓸 수 있습니다. `repo-transplant-mcp`는 아직 npm에 없으므로, 지금은 클론한 번들을 직접 실행합니다. 설치 단계는 필요 없습니다.
+MCP를 지원하는 모든 클라이언트에서 쓸 수 있습니다.
 
 ```bash
-git clone https://github.com/hs-hui/repo-transplant
-```
-
-```bash
-claude mcp add repo-transplant -- node /absolute/path/to/repo-transplant/plugin/dist/server.mjs
+claude mcp add repo-transplant -- npx -y repo-transplant-mcp
 ```
 
 ```json
 {
   "mcpServers": {
-    "repo-transplant": { "command": "node", "args": ["/absolute/path/to/repo-transplant/plugin/dist/server.mjs"] }
+    "repo-transplant": { "command": "npx", "args": ["-y", "repo-transplant-mcp"] }
   }
 }
 ```
 
-패키지가 배포되면 `node` 명령을 `npx -y repo-transplant-mcp`로 바꾸면 됩니다. 서버 자체에 작업 절차가 포함돼 있고 `transplant` 프롬프트도 제공합니다. 백엔드, UI, 프레임워크 간 이식 플레이북은 플러그인에만 있습니다.
+서버 자체에 작업 절차가 포함돼 있고 `transplant` 프롬프트도 제공합니다. 백엔드, UI, 프레임워크 간 이식 플레이북은 플러그인에만 있습니다.
 
 ## 이식 절차
 

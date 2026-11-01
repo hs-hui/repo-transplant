@@ -71,25 +71,21 @@ Then ask in plain words, or run `/repo-transplant:transplant <url> <feature>`.
 
 ### As an MCP server only
 
-For any MCP client. `repo-transplant-mcp` is not on npm yet, so for now run the bundle from a clone. It needs no install step.
+For any MCP client:
 
 ```bash
-git clone https://github.com/hs-hui/repo-transplant
-```
-
-```bash
-claude mcp add repo-transplant -- node /absolute/path/to/repo-transplant/plugin/dist/server.mjs
+claude mcp add repo-transplant -- npx -y repo-transplant-mcp
 ```
 
 ```json
 {
   "mcpServers": {
-    "repo-transplant": { "command": "node", "args": ["/absolute/path/to/repo-transplant/plugin/dist/server.mjs"] }
+    "repo-transplant": { "command": "npx", "args": ["-y", "repo-transplant-mcp"] }
   }
 }
 ```
 
-Once the package is published, `npx -y repo-transplant-mcp` replaces the `node` command. The server carries its workflow in its instructions and offers a `transplant` prompt. The skill's playbooks for backend, UI and cross-framework work are plugin-only.
+The server carries its workflow in its instructions and offers a `transplant` prompt. The skill's playbooks for backend, UI and cross-framework work are plugin-only.
 
 ## How a transplant runs
 
