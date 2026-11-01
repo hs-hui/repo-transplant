@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+- Approval works in the Claude desktop app. It declines every dialog without showing it, and the server took that for the user's answer. A decline that fast now falls back to the user's words, like a fast cancel.
+
 ## 1.0.0
 
 First release.

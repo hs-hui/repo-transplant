@@ -195,7 +195,7 @@ describe("approval through the client", () => {
   });
 
   it("stops when the user declines", async () => {
-    const { call } = await connect("decline");
+    const { call } = await connect("decline", {}, () => 700);
     const { session_id, plan_hash } = await plannedSession(call);
     await expect(
       call("transplant_approve", { session_id, plan_hash, user_confirmation: "the agent says yes" }),
@@ -203,22 +203,25 @@ describe("approval through the client", () => {
     expect((await call("transplant_status", { session_id })).stage).toBe("planned");
   });
 
-  it("falls back to the user's words when a client cancels without a person attached", async () => {
-    const { call } = await connect("cancel");
-    const { session_id, plan_hash } = await plannedSession(call);
-    await expect(call("transplant_approve", { session_id, plan_hash })).rejects.toThrow(
-      /confirmation_required/,
-    );
-    const approved = await call("transplant_approve", {
-      session_id,
-      plan_hash,
-      user_confirmation: "네, 진행해 주세요",
-    });
-    expect(approved.approved_via).toBe("agent_attested");
-  });
+  it.each<Elicit>(["cancel", "decline"])(
+    "falls back to the user's words when a client answers %s without a person attached",
+    async (answer) => {
+      const { call } = await connect(answer);
+      const { session_id, plan_hash } = await plannedSession(call);
+      await expect(call("transplant_approve", { session_id, plan_hash })).rejects.toThrow(
+        /confirmation_required/,
+      );
+      const approved = await call("transplant_approve", {
+        session_id,
+        plan_hash,
+        user_confirmation: "네, 진행해 주세요",
+      });
+      expect(approved.approved_via).toBe("agent_attested");
+    },
+  );
 
   it("treats a person closing the dialog as a no", async () => {
-    const { call } = await connect("cancel", {}, () => 400);
+    const { call } = await connect("cancel", {}, () => 700);
     const { session_id, plan_hash } = await plannedSession(call);
     await expect(
       call("transplant_approve", { session_id, plan_hash, user_confirmation: "the agent says yes" }),
@@ -227,7 +230,7 @@ describe("approval through the client", () => {
   });
 
   it("does not let the agent's word follow a person's no", async () => {
-    let wait = 400;
+    let wait = 700;
     const { call } = await connect("cancel", {}, () => wait);
     const { session_id, plan_hash } = await plannedSession(call);
     const attempt = () =>
@@ -246,7 +249,7 @@ describe("approval through the client", () => {
   });
 
   it("shows one dialog at a time, so an open one cannot make another look unattended", async () => {
-    const { call } = await connect("cancel", {}, () => 300);
+    const { call } = await connect("cancel", {}, () => 600);
     const first = await plannedSession(call);
     const second = await plannedSession(call);
     const results = await Promise.allSettled(
@@ -290,13 +293,16 @@ describe("approval through the client", () => {
     expect(approved.approved_via).toBe("agent_attested");
   });
 
-  it("treats a cancelled dialog as a no when a dialog is required", async () => {
-    const { call } = await connect("cancel", { requireDialog: true });
-    const { session_id, plan_hash } = await plannedSession(call);
-    await expect(
-      call("transplant_approve", { session_id, plan_hash, user_confirmation: "the agent says yes" }),
-    ).rejects.toThrow(/not_approved/);
-  });
+  it.each<Elicit>(["cancel", "decline"])(
+    "treats a fast %s as a no when a dialog is required",
+    async (answer) => {
+      const { call } = await connect(answer, { requireDialog: true });
+      const { session_id, plan_hash } = await plannedSession(call);
+      await expect(
+        call("transplant_approve", { session_id, plan_hash, user_confirmation: "the agent says yes" }),
+      ).rejects.toThrow(/not_approved/);
+    },
+  );
 
   it("requires the user's words when the client cannot ask", async () => {
     const { call } = await connect();

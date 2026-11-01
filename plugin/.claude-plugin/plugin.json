@@ -1,6 +1,6 @@
 {
   "name": "repo-transplant",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Transplant frontend and backend features between repositories, adapted to your stack, with license gates, behavior specs, scope audits and verified evidence.",
   "author": { "name": "hs-hui" },
   "homepage": "https://github.com/hs-hui/repo-transplant",

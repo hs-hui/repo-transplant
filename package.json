@@ -1,6 +1,6 @@
 {
   "name": "repo-transplant-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server and Claude Code plugin that transplants frontend and backend features between repositories with license gates, behavior specs, scope audits and verified evidence.",
   "type": "module",
   "license": "MIT",

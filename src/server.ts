@@ -68,7 +68,7 @@ const NETWORK_READ: ToolAnnotations = { readOnlyHint: false, destructiveHint: fa
 const LOCAL_WRITE: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
 
 const DIALOG_TIMEOUT_MS = 600_000;
-const NO_PERSON_MS = 250;
+const NO_PERSON_MS = 500;
 const SNAPSHOT_ID = z.string().describe("Snapshot id returned by repo_fetch.");
 const SESSION_ID = z.string().describe("Session id returned by transplant_start.");
 const DISTRIBUTION = z
@@ -157,11 +157,11 @@ export function createServer(config: Config = loadConfig()): McpServer {
         { timeout: DIALOG_TIMEOUT_MS },
       )
       .catch(() => null);
-    // Headless clients advertise elicitation and then cancel within milliseconds. A person closing
-    // the dialog also reads as a cancel, and that has to stay a no, so only speed tells them apart.
-    if (answer?.action === "cancel" && performance.now() - asked < NO_PERSON_MS && !config.requireDialog) {
-      return null;
-    }
+    // Some clients advertise elicitation and answer within milliseconds without showing anything:
+    // headless Claude Code cancels, and an app on the Agent SDK with no dialog handler declines. A
+    // person's cancel or decline has to stay a no, so only speed tells them apart.
+    const refused = answer?.action === "cancel" || answer?.action === "decline";
+    if (refused && performance.now() - asked < NO_PERSON_MS && !config.requireDialog) return null;
     if (answer?.action !== "accept" || answer.content?.approve !== true) {
       throw new TransplantError("not_approved", "The user did not approve.");
     }
