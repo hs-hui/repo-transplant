@@ -14,7 +14,7 @@
 - The scan and the snapshot share one 500,000-file limit, and a file the scan was asked for but could not list is reported.
 - The whole-repository license check covers tests and stylesheets too, with no limit on the number of files.
 - Tracing follows Android module layouts, nested Go modules, Java and Kotlin wildcard and static imports, Rust `use` groups and `super` chains, and Python one-line, semicolon and backslash imports.
-- A run where no test ran, or every test was skipped, no longer passes. That covers Go's `[no tests to run]` and all-skipped vitest, Jest, pytest, node:test and cargo runs.
+- A run where no test ran, or every test was skipped, no longer passes. That covers Go's `[no tests to run]` and all-skipped vitest, Jest, pytest, node:test, unittest and cargo runs, and `go test -v`. Plain `go test` prints nothing to tell a skip from a pass.
 - A skipped test is not evidence. A manual criterion can only be left open for a person, a visual one needs `screenshot_path` naming a real image, and the approval summary and report show how each criterion is checked.
 - Go failures carry their package, so a new failure cannot pass as an old one with the same name.
 - npm, pnpm, yarn and bun installs need `--ignore-scripts` or `install_scripts_reason`.
