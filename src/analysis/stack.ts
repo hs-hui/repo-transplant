@@ -84,21 +84,37 @@ function differences(source: RepoProfile, target: RepoProfile): CategoryDifferen
   return rows.sort((a, b) => order[a.status] - order[b.status]);
 }
 
-function rangesCompatible(ecosystem: Ecosystem, a: string, b: string): boolean | null {
+export function rangesCompatible(ecosystem: Ecosystem, a: string, b: string): boolean | null {
   if (a === "*" || b === "*") return true;
   if (ecosystem === "npm") {
     if (!semver.validRange(a) || !semver.validRange(b)) return null;
     return semver.intersects(a, b);
   }
-  if (ecosystem === "go" || ecosystem === "cargo") {
-    const major = (value: string): number | undefined => semver.coerce(value)?.major;
-    return major(a) === undefined || major(b) === undefined ? null : major(a) === major(b);
+  if (ecosystem === "cargo") {
+    // A bare Cargo version is a caret range, and commas separate requirements.
+    const range = (value: string): string => {
+      const spaced = value.replace(/,/g, " ").trim();
+      return /^\d/.test(spaced) ? `^${spaced}` : spaced;
+    };
+    if (!semver.validRange(range(a)) || !semver.validRange(range(b))) return null;
+    return semver.intersects(range(a), range(b));
+  }
+  if (ecosystem === "go") {
+    // Before 1.0 the leftmost nonzero number is the one that breaks things.
+    const line = (value: string): string | undefined => {
+      const version = semver.coerce(value);
+      if (!version) return undefined;
+      if (version.major > 0) return `${version.major}`;
+      return version.minor > 0 ? `0.${version.minor}` : `0.0.${version.patch}`;
+    };
+    return line(a) === undefined || line(b) === undefined ? null : line(a) === line(b);
   }
   return a === b ? true : null;
 }
 
 function normalize(ecosystem: Ecosystem, name: string): string {
-  return ecosystem === "pypi" ? name.toLowerCase().replace(/_/g, "-") : name;
+  if (ecosystem === "pypi") return name.toLowerCase().replace(/_/g, "-");
+  return ecosystem === "cargo" ? name.replace(/_/g, "-") : name;
 }
 
 function decide(

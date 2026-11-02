@@ -51,6 +51,7 @@ Call `transplant_trace` with seed files. Check the closure against what the user
 - `shared_infrastructure` is never copied. Map each one to the target's equivalent.
 - `integration_points` show how the feature connects to its host. Read them.
 - `backend` lists routes, models, migrations, env vars, jobs and services. Backend work depends on this list.
+- `flagged_outside_trace` lists files that the whole-repository scan flagged but this closure leaves out. If the feature uses one, trace it. If it does not, the plan must say so in `out_of_scope_reason`. Never leave a flagged file out to get past a finding.
 - Read the `limitations`. Framework magic such as Rails autoloading or dependency injection is not an import edge, so read entry files yourself.
 
 Call `assess_feasibility`. Then call `stack_compare` with `trace.external_packages`, and `package_inspect` on any package you may add. If difficulty is `high` or `very_high`, or the result was not what the user expected, summarize it and let them decide before you go further.
@@ -65,13 +66,13 @@ Read [references/spec-guide.md](references/spec-guide.md) before writing it. For
 
 ### 5. Plan and get approval
 
-Call `transplant_record_plan`. Every file you will touch goes in the plan, because the audit compares against it. Build `verification.commands` from the target's `suggested_commands`, adding a verbose test reporter so test names reach the log. Keep the install command's safety flag where the tool has one, such as `--ignore-scripts` for npm, pnpm, yarn and bun or `--only-binary=:all:` for pip. `uv` and `poetry` have no such flag. Commands run in a separate copy of the reviewed files with no `.git`, so they must not need git history. Run formatters in check mode, because a command that rewrites reviewed files does not pass.
+Call `transplant_record_plan`. Every file you will touch goes in the plan, because the audit compares against it. Build `verification.commands` from the target's `suggested_commands`, or `suggested_docker_commands` when the plan sets `docker_image`, adding a verbose test reporter so test names reach the log. Keep the install command's safety flag where the tool has one, such as `--ignore-scripts` for npm, pnpm, yarn and bun, which the plan needs unless it sets `verification.install_scripts_reason`, or `--only-binary=:all:` for pip. `uv` and `poetry` have no such flag. Commands run in a separate copy of the reviewed files with no `.git`, so they must not need git history. Run formatters in check mode, because a command that rewrites reviewed files does not pass.
 
 For anything a user sees in a browser, plan a real browser check by default, using the Browser section of [references/frontend.md](references/frontend.md). The server refuses a plan that changes UI files with neither an `e2e` command nor `verification.no_browser_check_reason`. Use that reason only if the app cannot run in a container or the user says so, because the user reads it before approving.
 
 Check the plan can run here before you ask. The summary lists tools missing from this machine in `missing_tools`, and `repo_profile` offers `suggested_docker_image` and `suggested_services`. Official Node images have no pnpm on the path, so use `corepack pnpm` there. Tests in a fresh copy have no `.env`, so read `.env.example` and set placeholder values in the command's `env`. If the checks need a compiler or runtime this machine lacks, set `verification.docker_image` to an image that has it. If they need a database or another service, add it to `verification.services` with a `ready_command`, and connect to it by its `name`. Services need `docker_image`. On Linux and macOS, commands in a container run as the user rather than root, so install into the project, such as a virtual environment, not globally. Commands other than install reach those services and nothing else. Prefer running the whole test suite this way to narrowing it.
 
-**Show `approval_summary` to the user** with what the feature will do, the license conditions and the risks. Wait for their answer. Then call `transplant_approve` with `plan_hash` and the user's own words in `user_confirmation`. If the client shows its own approval dialog, that answer decides. A `not_approved` error means the user said no: stop and ask what they want to change.
+**Show `approval_summary` to the user** with what the feature will do, the license conditions and the risks. If it lists files left out of the plan, show those and `out_of_scope_reason` too, since the user decides whether that reason holds. Wait for their answer. Then call `transplant_approve` with `plan_hash` and the user's own words in `user_confirmation`. If the client shows its own approval dialog, that answer decides. A `not_approved` error means the user said no: stop and ask what they want to change.
 
 If the user changes anything, record a new plan and ask again. Approval covers one exact plan.
 
@@ -103,7 +104,7 @@ Any edit makes earlier audit, verification and evidence stale, and clears instal
 
 For a UI feature, also use it running, because passing tests have missed real bugs here. Start the target from the worktree and go through the acceptance criteria by hand in a browser. Take a screenshot and compare it with the design of the surrounding pages. If you have no browser, make the check repeatable: read the Browser section of [references/frontend.md](references/frontend.md). If that cannot run either, say so in your closing message and ask the user to try it, rather than letting the test results stand in for it. To compare with the original, use a deployed demo URL from the user, or run the source only in a sandbox they approve. `visual_compare` diffs two screenshots.
 
-Criteria marked `manual` or `visual` in the spec can be recorded as `manual_required` when a person has to check them, such as an email actually arriving. Automated criteria cannot: if one cannot be proven here, the transplant is incomplete, and the report must say so.
+Criteria marked `manual` are recorded as `manual_required`, because only a person can pass them, such as an email actually arriving. A `visual` criterion can pass with `kind: "screenshot"` and `screenshot_path` naming a real image, or be left as `manual_required`. Automated criteria cannot: if one cannot be proven here, the transplant is incomplete, and the report must say so.
 
 ### 8. Report
 

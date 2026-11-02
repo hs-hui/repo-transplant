@@ -8,6 +8,8 @@ import type { Ecosystem } from "./manifests.js";
 export interface GraphNode {
   file: RepoFile;
   internal: Set<string>;
+  /** Files of the same package that need no import. They do not count toward how widely a file is used. */
+  samePackage: Set<string>;
   external: Set<string>;
   unresolved: string[];
 }
@@ -31,10 +33,13 @@ interface ResolveContext {
   byDir: Map<string, string[]>;
   aliases: { base: string; rules: AliasRule[] }[];
   workspacePackages: Map<string, string>;
-  goModule: string | null;
-  goRoot: string;
+  goModules: { module: string; root: string }[];
   phpNamespaces: [string, string][];
   jvmSuffix: Map<string, string>;
+  jvmPackages: Set<string>;
+  goPackages: Map<string, string[]>;
+  /** Lookups wildcard imports may still spend, so a hostile repository cannot make them quadratic. */
+  wildcardBudget: number;
 }
 
 const JS_RESOLVE_EXT = [
@@ -60,6 +65,8 @@ const PYTHON_STDLIB = new Set(
     " ",
   ),
 );
+
+const JVM_PACKAGE_ROOTS = new Set(["com", "org", "io", "net", "dev", "app", "me"]);
 
 function posixJoin(dir: string, spec: string): string {
   const joined = path.posix.normalize(path.posix.join(dir, spec));
@@ -176,14 +183,26 @@ function resolvePython(
   return { external: top.toLowerCase().replace(/_/g, "-") };
 }
 
+function goPackageFiles(dir: string, ctx: ResolveContext): string[] {
+  const known = ctx.goPackages.get(dir);
+  if (known) return known;
+  const files = (ctx.byDir.get(dir) ?? []).filter(
+    (file) => file.endsWith(".go") && !file.endsWith("_test.go"),
+  );
+  ctx.goPackages.set(dir, files);
+  return files;
+}
+
 function resolveGo(item: RawImport, ctx: ResolveContext): { internals?: string[]; external?: string } {
   const spec = item.specifier;
-  if (ctx.goModule && (spec === ctx.goModule || spec.startsWith(`${ctx.goModule}/`))) {
-    const dir = posixJoin(ctx.goRoot, spec.slice(ctx.goModule.length).replace(/^\//, ""));
-    const files = (ctx.byDir.get(dir) ?? []).filter(
-      (file) => file.endsWith(".go") && !file.endsWith("_test.go"),
-    );
-    return { internals: files };
+  const owner = ctx.goModules.find((entry) => spec === entry.module || spec.startsWith(`${entry.module}/`));
+  if (owner) {
+    return {
+      internals: goPackageFiles(
+        posixJoin(owner.root, spec.slice(owner.module.length).replace(/^\//, "")),
+        ctx,
+      ),
+    };
   }
   if (!spec.split("/")[0]!.includes(".")) return {};
   const parts = spec.split("/");
@@ -197,11 +216,18 @@ function resolveRust(
 ): { internal?: string; external?: string } {
   const spec = item.specifier;
   const fromDir = path.posix.dirname(rel) === "." ? "" : path.posix.dirname(rel);
+  // expr.rs keeps its child modules in expr/; crate roots and mod.rs keep them beside it. Every file
+  // directly under tests/, examples/, benches/ and src/bin/ is a crate root of its own.
+  const stem = path.posix.basename(rel, ".rs");
+  const beside =
+    stem === "mod" ||
+    stem === "lib" ||
+    stem === "main" ||
+    /(^|\/)(tests|examples|benches|src\/bin)$/.test(fromDir);
+  const moduleDir = beside ? fromDir : posixJoin(fromDir, stem);
   if (spec.startsWith("mod:")) {
     const name = spec.slice(4);
-    const stem = path.posix.basename(rel, ".rs");
-    const base = stem === "mod" || stem === "lib" || stem === "main" ? fromDir : posixJoin(fromDir, stem);
-    const hit = tryFile(posixJoin(base, name), ctx, [".rs", "/mod.rs"]);
+    const hit = tryFile(posixJoin(moduleDir, name), ctx, [".rs", "/mod.rs"]);
     return hit ? { internal: hit } : {};
   }
   const parts = spec.split("::");
@@ -209,19 +235,25 @@ function resolveRust(
   if (head === "std" || head === "core" || head === "alloc") return {};
   if (head === "crate" || head === "self" || head === "super") {
     let base: string;
+    let start = 1;
     if (head === "crate") {
       const srcIndex = rel.lastIndexOf("src/");
       base = srcIndex === -1 ? "src" : rel.slice(0, srcIndex + 3);
     } else if (head === "self") {
-      base = fromDir;
+      base = moduleDir;
     } else {
-      base = path.posix.dirname(fromDir) === "." ? "" : path.posix.dirname(fromDir);
+      base = moduleDir;
+      for (start = 0; parts[start] === "super"; start++) {
+        base = path.posix.dirname(base) === "." ? "" : path.posix.dirname(base);
+      }
     }
-    for (let end = parts.length; end > 1; end--) {
-      const hit = tryFile(posixJoin(base, parts.slice(1, end).join("/")), ctx, [".rs", "/mod.rs"]);
+    for (let end = parts.length; end > start; end--) {
+      const hit = tryFile(posixJoin(base, parts.slice(start, end).join("/")), ctx, [".rs", "/mod.rs"]);
       if (hit) return { internal: hit };
     }
-    return {};
+    // `use super::*` names the module itself, which lives beside its directory or at the crate root.
+    const own = tryFile(base, ctx, [".rs", "/mod.rs", "/lib.rs", "/main.rs"]);
+    return own ? { internal: own } : {};
   }
   return { external: head.replace(/_/g, "-") };
 }
@@ -260,11 +292,29 @@ function resolvePhp(
   return name ? { external: `${vendor}\\${name}` } : {};
 }
 
-function resolveJvm(item: RawImport, ctx: ResolveContext): { internal?: string; external?: string } {
-  const hit = ctx.jvmSuffix.get(item.specifier.replace(/\./g, "/"));
-  if (hit) return { internal: hit };
-  const parts = item.specifier.split(".");
-  if (["java", "javax", "kotlin", "jdk", "sun"].includes(parts[0]!)) return {};
+function resolveJvm(
+  item: RawImport,
+  ctx: ResolveContext,
+  words: Set<string>,
+): { internal?: string; internals?: string[]; external?: string } {
+  // A wildcard keeps its trailing dot. It brings in the classes this file names, each in the file named after it.
+  const parts = item.specifier.replace(/\.$/, "").split(".");
+  const dir = parts.join("/");
+  const members: string[] = [];
+  const known = item.specifier.endsWith(".") && ctx.jvmPackages.has(dir);
+  if (known && ctx.wildcardBudget > 0) {
+    ctx.wildcardBudget -= words.size;
+    for (const word of words) {
+      const member = ctx.jvmSuffix.get(`${dir}/${word}`);
+      if (member) members.push(member);
+    }
+  }
+  for (let end = parts.length; end > 0; end--) {
+    const hit = ctx.jvmSuffix.get(parts.slice(0, end).join("/"));
+    if (hit) return { internals: [...members, hit] };
+  }
+  if (members.length > 0) return { internals: members };
+  if (known || ["java", "javax", "kotlin", "jdk", "sun"].includes(parts[0]!)) return {};
   return { external: parts.slice(0, 3).join(".") };
 }
 
@@ -327,6 +377,7 @@ async function buildContext(files: RepoFile[], root: string, maxBytes: number): 
   const fileSet = new Set(files.map((file) => file.rel));
   const byDir = new Map<string, string[]>();
   const jvmSuffix = new Map<string, string>();
+  const jvmPackages = new Set<string>();
   for (const file of files) {
     const dir = path.posix.dirname(file.rel) === "." ? "" : path.posix.dirname(file.rel);
     const list = byDir.get(dir);
@@ -334,8 +385,18 @@ async function buildContext(files: RepoFile[], root: string, maxBytes: number): 
     else byDir.set(dir, [file.rel]);
     if (file.ext === ".java" || file.ext === ".kt") {
       const noExt = file.rel.slice(0, -file.ext.length);
-      const anchor = noExt.search(/(^|\/)(com|org|io|net|dev|app|me)\//);
-      if (anchor !== -1) jvmSuffix.set(noExt.slice(anchor === 0 ? 0 : anchor + 1), file.rel);
+      const segments = noExt.split("/");
+      const keys = new Set<string>();
+      const sourceRoot = noExt.match(/(?:^|\/)src\/\w+\/(?:java|kotlin)\/(.+)$/);
+      if (sourceRoot) keys.add(sourceRoot[1]!);
+      // Every package root counts, so a module directory in front of the package does not hide it.
+      for (let index = 0; index < segments.length - 1; index++) {
+        if (JVM_PACKAGE_ROOTS.has(segments[index]!)) keys.add(segments.slice(index).join("/"));
+      }
+      for (const key of keys) {
+        jvmSuffix.set(key, file.rel);
+        jvmPackages.add(path.posix.dirname(key));
+      }
     }
   }
 
@@ -347,15 +408,17 @@ async function buildContext(files: RepoFile[], root: string, maxBytes: number): 
     if (name && dir !== ".") workspacePackages.set(name, dir);
   }
 
-  let goModule: string | null = null;
-  let goRoot = "";
-  const goMod = files.find((file) => path.posix.basename(file.rel) === "go.mod");
-  if (goMod) {
-    const text = await readText(path.join(root, goMod.rel), maxBytes);
-    goModule = text?.match(/^module\s+(\S+)/m)?.[1] ?? null;
-    const dir = path.posix.dirname(goMod.rel);
-    goRoot = dir === "." ? "" : dir;
+  // A nested module can share a prefix with the root, so the longest module path is matched first.
+  // A copy of a module path deeper in the tree loses to the shallower one. Vendored modules stay external.
+  const goModules: ResolveContext["goModules"] = [];
+  for (const file of files.filter((item) => path.posix.basename(item.rel) === "go.mod")) {
+    if (/(^|\/)(vendor|third_party)\//.test(file.rel)) continue;
+    const text = await readText(path.join(root, file.rel), maxBytes);
+    const modulePath = text?.match(/^module\s+"?([^"\s]+)/m)?.[1];
+    const dir = path.posix.dirname(file.rel);
+    if (modulePath) goModules.push({ module: modulePath, root: dir === "." ? "" : dir });
   }
+  goModules.sort((a, b) => b.module.length - a.module.length || a.root.length - b.root.length);
 
   const phpNamespaces: [string, string][] = [["App\\", "app"]];
   const composerText = fileSet.has("composer.json")
@@ -375,21 +438,43 @@ async function buildContext(files: RepoFile[], root: string, maxBytes: number): 
     byDir,
     aliases: await loadAliases(files, root, maxBytes),
     workspacePackages,
-    goModule,
-    goRoot,
+    goModules,
     phpNamespaces,
     jvmSuffix,
+    jvmPackages,
+    goPackages: new Map(),
+    wildcardBudget: 100_000_000,
   };
 }
+
+/** Files in one Go package that link to each other. Past this a directory is generated code or hostile. */
+const MAX_GO_SIBLINGS = 500;
 
 function connect(
   node: GraphNode,
   rel: string,
   language: ImportLanguage,
-  imports: RawImport[],
+  text: string,
   ctx: ResolveContext,
 ): void {
   const fromDir = path.posix.dirname(rel) === "." ? "" : path.posix.dirname(rel);
+  const parsed = extractImports(rel, text);
+  // A repeated import adds nothing, and each wildcard costs a look at every word in the file.
+  const imports =
+    language === "jvm" ? [...new Map(parsed.map((item) => [item.specifier, item])).values()] : parsed;
+  const words = new Set(language === "jvm" ? text.match(/[A-Za-z_]\w*/g) : []);
+  if (language === "jvm") {
+    for (const word of words) {
+      const sibling = tryFile(posixJoin(fromDir, word), ctx, [".java", ".kt"]);
+      if (sibling && sibling !== rel) node.samePackage.add(sibling);
+    }
+  }
+  if (language === "go" && !rel.endsWith("_test.go")) {
+    const siblings = goPackageFiles(fromDir, ctx);
+    if (siblings.length <= MAX_GO_SIBLINGS) {
+      for (const sibling of siblings) if (sibling !== rel) node.samePackage.add(sibling);
+    }
+  }
   for (const item of imports) {
     let result: { internal?: string; internals?: string[]; external?: string; unresolved?: string };
     switch (language) {
@@ -412,7 +497,7 @@ function connect(
         result = resolvePhp(item, fromDir, ctx);
         break;
       case "jvm":
-        result = resolveJvm(item, ctx);
+        result = resolveJvm(item, ctx, words);
         break;
       case "style":
         result = resolveStyle(item, fromDir, ctx);
@@ -448,7 +533,13 @@ export function buildGraph(
     const texts = new Map<string, string>();
     let heldBytes = 0;
     for (const file of files) {
-      const node: GraphNode = { file, internal: new Set(), external: new Set(), unresolved: [] };
+      const node: GraphNode = {
+        file,
+        internal: new Set(),
+        samePackage: new Set(),
+        external: new Set(),
+        unresolved: [],
+      };
       nodes.set(file.rel, node);
       const language = importLanguage(file.rel);
       const readable =
@@ -460,7 +551,7 @@ export function buildGraph(
         texts.set(file.rel, text);
         heldBytes += text.length;
       }
-      if (language) connect(node, file.rel, language, extractImports(file.rel, text), ctx);
+      if (language) connect(node, file.rel, language, text, ctx);
     }
     for (const [rel, node] of nodes) {
       for (const dep of node.internal) {

@@ -12,20 +12,35 @@ import { exportBase, modifiedInRun, RUN_HOME, syncRunDirectory, type Workspace }
 
 const NO_TESTS =
   /(no test files found|no tests found|no tests ran|collected 0 items|ran 0 tests|running 0 tests|(?<![\d.,])0 passing|(?<![\d.,])0 tests? (run|executed)|^\D*\btests\s+0\s*$|tests?:\s+0 total|\bno test suites? found)/im;
-const SOME_TESTS_RAN = /\brunning [1-9]\d* tests?\b|\b[1-9]\d* (tests? )?pass(ed|ing)\b/i;
+/** Summaries where every test was skipped. Exit code 0 here means nothing was proven. */
+const ALL_SKIPPED =
+  /^\s*Tests\s+(?:\d+ (?:skipped|todo)(?: \| )?)+ ?\(\d+\)\s*$|^\s*Tests:\s+(?:\d+ (?:skipped|todo),\s*)+\d+ total\s*$|^[\s=]*\d+ (?:skipped|deselected)(?:, \d+ (?:skipped|deselected|xfailed|xpassed))* in [\d.]+/m;
+const NODE_NONE_PASSED = /^[#ℹ]\s*pass 0\s*$/m;
+const SOME_TESTS_RAN = /\brunning [1-9]\d* tests?\b|\b[1-9]\d* (tests? )?pass(ed|ing)\b|^[#ℹ]\s*pass [1-9]/im;
 const TAIL_BYTES = 6000;
 const MAX_LOG_BYTES = 20 * 1024 * 1024;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal", ""]);
 /** Settings that load code or redirect tooling. A plan cannot set these, however it was approved. */
 const FORBIDDEN_ENV =
   /^(NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|LD_.*|DYLD_.*|PATH|PATHEXT|HOME|USERPROFILE|PYTHON(PATH|STARTUP|HOME|INSPECT)|RUBY(OPT|LIB)|PERL5(OPT|LIB)|BASH_ENV|ENV|ZDOTDIR|GIT_.*|NPM_CONFIG_.*|YARN_.*|PIP_.*|UV_.*|CARGO_.*|RUSTC.*|RUSTUP_.*|_?JAVA_(TOOL_)?OPTIONS|JDK_JAVA_OPTIONS|DOTNET_STARTUP_HOOKS|COR(ECLR)?_.*|COMSPEC|PGSERVICE|PGSERVICEFILE|PGPASSFILE|MYSQL_HOME)$/i;
+/** Settings under those prefixes that only tune output or caching. */
+const HARMLESS_ENV =
+  /^(CARGO_TERM_\w+|CARGO_INCREMENTAL|CARGO_PROFILE_\w+|PIP_NO_\w+|PIP_DISABLE_\w+|PIP_CACHE_DIR|UV_CACHE_DIR|UV_NO_CACHE|UV_NO_PROGRESS|UV_LINK_MODE|NPM_CONFIG_(LOGLEVEL|AUDIT|FUND|PROGRESS))$/i;
+const isForbiddenEnv = (name: string): boolean => FORBIDDEN_ENV.test(name) && !HARMLESS_ENV.test(name);
 /** Names that hold a connection target, so their plain values are read as hosts. */
 const CONNECTION_VARIABLE =
   /(^|_)(HOST|HOSTS|HOSTNAME|SERVER|ADDR|ADDRESS|ENDPOINT|DSN|URL|URI|CONNECTION|BROKERS?)(_|$)|^PGHOST|^DATABASE/i;
 const DATABASE_URL =
-  /(?:jdbc:)?\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?|sqlserver|mssql):\/\/\S+/gi;
+  /(?:jdbc:)?\b(?:postgres(?:ql)?|mysql|mariadb|mongodb|redis|rediss|amqps?|sqlserver|mssql)(?:\+[a-z0-9_]+)?:\/\/\S+/gi;
 const CLI_HOST = /(?:^|\s)(?:-h|--host|--hostname|--server)[=\s]+['"]?([^\s'"]+)/g;
 const INLINE_HOST = /(?:^|\s)(?:PGHOST|MYSQL_HOST|DB_HOST|DATABASE_HOST|REDIS_HOST)=['"]?([^\s'"]+)/g;
+/** Database clients also take -hHOST, which other tools use for flags such as `df -h`, so only these count. */
+const DB_CLI_HOST =
+  /\b(?:psql|pg_dump|pg_restore|mysql|mysqldump|mariadb|redis-cli|mongosh?)\b[^\n;&|]*?\s-h([^\s'"=]+)/g;
+const SQLCMD_HOST = /\bsqlcmd\b[^\n;&|]*?\s-S\s*['"]?([^\s'"]+)/g;
+const KEYWORD_HOST = /(?:^|[\s'"])(?:host|hostaddr)\s*=\s*['"]?([^\s'";&]+)/gi;
+/** A variable set in the command text. The env field is checked by name, so this has to be too. */
+const INLINE_ASSIGNMENT = /(?:^|[\s;&|(])(?:export\s+|set\s+|env\s+|\$env:)?([A-Za-z_]\w*)=/g;
 
 const SERVICE_READY_ATTEMPTS = 60;
 const MAX_FAILURES = 200;
@@ -34,7 +49,8 @@ export interface CommandSummary extends VerificationRun {
   output_tail: string;
 }
 
-type Command = TransplantPlan["verification"]["commands"][number];
+export type VerifiedCommand = TransplantPlan["verification"]["commands"][number];
+type Command = VerifiedCommand;
 
 function stripPort(raw: string): string {
   const host = raw.trim();
@@ -94,26 +110,58 @@ export function assertLocalEnv(command: Command, services: string[] = []): void 
       "Verification commands may reach local services only. Run migrations against remote databases yourself.",
     );
   };
+  // A variable in the text is judged where it is set, which the env check covers.
   const isLocal = (host: string): boolean =>
-    LOCAL_HOSTS.has(host) || host.startsWith("/") || services.includes(host);
+    LOCAL_HOSTS.has(host) || host.startsWith("/") || host.startsWith("$") || services.includes(host);
   for (const [key, value] of Object.entries(command.env)) {
-    if (FORBIDDEN_ENV.test(key)) {
+    if (isForbiddenEnv(key)) {
       throw new TransplantError("forbidden_env", `${command.name}: ${key} cannot be set by a plan.`);
     }
     const remote = hostsIn(value, CONNECTION_VARIABLE.test(key)).find((host) => !isLocal(host));
     if (remote) refuse(`${key} points at ${remote}`);
   }
   const text = command.command;
+  for (const match of text.matchAll(INLINE_ASSIGNMENT)) {
+    if (isForbiddenEnv(match[1]!)) {
+      throw new TransplantError("forbidden_env", `${command.name}: ${match[1]} cannot be set by a plan.`);
+    }
+  }
   for (const url of text.match(DATABASE_URL) ?? []) {
     const remote = hostsIn(url, true).find((host) => !isLocal(host));
     if (remote) refuse(`the command connects to ${remote}`);
   }
-  for (const pattern of [CLI_HOST, INLINE_HOST]) {
+  for (const pattern of [CLI_HOST, INLINE_HOST, DB_CLI_HOST, SQLCMD_HOST, KEYWORD_HOST]) {
     for (const match of text.matchAll(pattern)) {
       const host = stripPort(match[1]!);
       if (!isLocal(host)) refuse(`the command connects to ${host}`);
     }
   }
+}
+
+/** Subcommands that run package scripts, for the tools with a flag to stop them. */
+const INSTALL_VERBS: Record<string, string[]> = {
+  npm: ["install", "i", "ci", "add", "it", "cit", "install-test", "install-ci-test", "rebuild"],
+  pnpm: ["install", "i", "add", "rebuild"],
+  bun: ["install", "i", "add"],
+  yarn: ["install", "add"],
+};
+const VALUE_FLAGS = new Set(["--prefix", "-w", "--workspace", "--filter", "-F", "-C", "--dir", "--cwd"]);
+
+/** Whether a command would run package install scripts. Each step of a chain is judged alone. */
+export function runsInstallScripts(command: string): boolean {
+  return command.split(/&&|\|\||[;|\n]/).some((step) => {
+    const words = step.trim().split(/\s+/);
+    const at = words.findIndex((word) => Object.hasOwn(INSTALL_VERBS, word));
+    if (at === -1) return false;
+    let index = at + 1;
+    while (words[index]?.startsWith("-")) index += VALUE_FLAGS.has(words[index]!) ? 2 : 1;
+    const tool = words[at]!;
+    const verb = words[index];
+    // A bare `yarn` installs.
+    if (!(verb === undefined ? tool === "yarn" : INSTALL_VERBS[tool]!.includes(verb))) return false;
+    const flag = words.filter((word) => /^--ignore-scripts(=|$)/.test(word)).at(-1);
+    return flag === undefined || flag === "--ignore-scripts=false";
+  });
 }
 
 const SHELL_BUILTIN = /^(cd|echo|test|true|false|export|set|exit|\[|:|if|for|while|then|do|done|fi)$/;
@@ -204,42 +252,87 @@ interface RunningServices {
   containers: string[];
 }
 
-const docker = (args: string[], timeoutMs = 300_000): Promise<ExecResult> =>
-  exec("docker", args, { timeoutMs, maxOutputBytes: 1024 * 1024 });
+const docker = (args: string[], timeoutMs = 300_000, signal?: AbortSignal): Promise<ExecResult> =>
+  exec("docker", args, { timeoutMs, signal, maxOutputBytes: 1024 * 1024 });
+
+/** What is running now. Killing the docker client leaves a container running, so a shutdown stops these by name. */
+const activeContainers = new Set<string>();
+const activeNetworks = new Set<string>();
+
+/** Stops every container and network this process started. A hard kill or a crash never reaches this. */
+export async function stopContainers(): Promise<void> {
+  const containers = [...activeContainers];
+  const networks = [...activeNetworks];
+  await Promise.all(containers.map((name) => docker(["rm", "-f", name], 10_000).catch(() => undefined)));
+  await Promise.all(networks.map((name) => docker(["network", "rm", name], 10_000).catch(() => undefined)));
+}
 
 async function stopServices(running: RunningServices): Promise<void> {
-  for (const name of running.containers) await docker(["rm", "-f", name], 30_000).catch(() => undefined);
-  if (running.network) await docker(["network", "rm", running.network], 30_000).catch(() => undefined);
+  for (const name of running.containers) {
+    await docker(["rm", "-f", name], 30_000).catch(() => undefined);
+    activeContainers.delete(name);
+  }
+  if (running.network) {
+    await docker(["network", "rm", running.network], 30_000).catch(() => undefined);
+    activeNetworks.delete(running.network);
+  }
+}
+
+/** Waits, and stops waiting as soon as the run is cancelled. */
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    if (signal?.aborted) done();
+    else signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 /** Starts services on an internal network, which reaches other containers but not the internet. */
-async function startServices(services: Service[]): Promise<RunningServices> {
+export async function startServices(services: Service[], signal?: AbortSignal): Promise<RunningServices> {
   const running: RunningServices = { containers: [] };
   if (services.length === 0) return running;
   const id = randomId(6);
   try {
     const network = `rt-net-${id}`;
-    const created = await docker(["network", "create", "--internal", network], 60_000);
+    const created = await docker(["network", "create", "--internal", network], 60_000, signal);
+    stopIfCancelled(signal);
     if (created.code !== 0) throw new Error(created.stderr.trim());
     running.network = network;
+    activeNetworks.add(network);
     for (const service of services) {
       const name = `rt-service-${id}-${service.name}`;
       const env = Object.entries(service.env).flatMap(([key, value]) => ["-e", `${key}=${value}`]);
       const flags = ["--security-opt=no-new-privileges", "--pids-limit=1024", "--memory=2g"];
       const args = ["run", "-d", "--rm", `--name=${name}`, `--network=${network}`, ...flags];
-      const started = await docker([...args, `--network-alias=${service.name}`, ...env, service.image]);
-      if (started.code !== 0) throw new Error(`${service.name}: ${started.stderr.trim().slice(0, 400)}`);
+      // The name is claimed first, since a cancelled `docker run -d` can still leave the container behind.
       running.containers.push(name);
+      activeContainers.add(name);
+      const started = await docker(
+        [...args, `--network-alias=${service.name}`, ...env, service.image],
+        300_000,
+        signal,
+      );
+      stopIfCancelled(signal);
+      if (started.code !== 0) throw new Error(`${service.name}: ${started.stderr.trim().slice(0, 400)}`);
       let ready = false;
       for (let attempt = 0; attempt < SERVICE_READY_ATTEMPTS && !ready; attempt++) {
-        ready = (await docker(["exec", name, "sh", "-c", service.ready_command], 15_000)).code === 0;
-        if (!ready) await new Promise((resolve) => setTimeout(resolve, 1000));
+        const probe = await docker(["exec", name, "sh", "-c", service.ready_command], 15_000, signal);
+        stopIfCancelled(signal);
+        ready = probe.code === 0;
+        if (!ready) await pause(1000, signal);
+        stopIfCancelled(signal);
       }
       if (!ready) throw new Error(`${service.name} did not become ready.`);
     }
     return running;
   } catch (error) {
     await stopServices(running);
+    if (error instanceof TransplantError) throw error;
     throw new TransplantError("service_failed", `Could not start a verification service: ${String(error)}`);
   }
 }
@@ -259,12 +352,22 @@ async function runOne(command: Command, context: RunContext): Promise<ExecResult
       const name = `rt-verify-${randomId(6)}`;
       const args = dockerArgs(context.dockerImage, context.runDir, command, name, context.network);
       const { signal } = context;
-      const result = await exec("docker", args, { timeoutMs, onOutput, signal, maxOutputBytes: 1024 * 1024 });
-      // Killing the client leaves the container running, so stop it by name.
-      if (result.timedOut || signal?.aborted) {
-        await exec("docker", ["kill", name], { timeoutMs: 15_000 }).catch(() => undefined);
+      activeContainers.add(name);
+      try {
+        const result = await exec("docker", args, {
+          timeoutMs,
+          onOutput,
+          signal,
+          maxOutputBytes: 1024 * 1024,
+        });
+        // Killing the client leaves the container running, so stop it by name.
+        if (result.timedOut || signal?.aborted) {
+          await exec("docker", ["kill", name], { timeoutMs: 15_000 }).catch(() => undefined);
+        }
+        return result;
+      } finally {
+        activeContainers.delete(name);
       }
-      return result;
     }
     await mkdir(context.homeDir, { recursive: true });
     return await exec(command.command, [], {
@@ -285,9 +388,9 @@ function stopIfCancelled(signal?: AbortSignal): void {
   if (signal?.aborted) throw new TransplantError("cancelled", "Cancelled. Nothing from this run counts.");
 }
 
-function classify(
+export function classifyRun(
   command: Command,
-  result: ExecResult,
+  result: Pick<ExecResult, "code" | "timedOut">,
   output: string,
   changed: boolean,
 ): VerificationRun["status"] {
@@ -296,32 +399,65 @@ function classify(
   // Results describe the code that ran, so a command that rewrites tracked files proves nothing.
   if (changed && command.kind !== "install") return "modified_files";
   const isTest = command.kind === "test" || command.kind === "e2e";
-  const goWithoutTests = /\[no test files\]/.test(output) && !/^ok\s/m.test(output);
+  if (!isTest) return "passed";
+  const plain = stripAnsi(output);
+  // `go test` prints "ok" with [no tests to run] for a package whose filter or test file matched nothing.
+  const goRan = /^ok\s(?!.*\[no tests to run\])/m.test(plain);
+  const goWithoutTests = /\[no test files\]|\[no tests to run\]/.test(plain) && !goRan;
   // Cargo prints "running 0 tests" for each target without tests, beside the ones that have them.
-  const noTests = NO_TESTS.test(output) && !SOME_TESTS_RAN.test(output);
-  if (isTest && (noTests || goWithoutTests)) return "no_tests_ran";
-  return "passed";
+  const noTests = NO_TESTS.test(plain) && !SOME_TESTS_RAN.test(plain);
+  const cargoResults = plain.match(/^test result: .*$/gm) ?? [];
+  const cargoNonePassed = cargoResults.length > 0 && cargoResults.every((line) => /\b0 passed\b/.test(line));
+  const goSkipped = /^\s*--- SKIP: /m.test(plain) && !/^\s*--- PASS: /m.test(plain);
+  const unittest = plain.match(/^Ran (\d+) tests? in [\s\S]*?^OK \(skipped=(\d+)\)\s*$/m);
+  const unittestSkipped = unittest !== null && unittest[1] === unittest[2];
+  const skipped =
+    goSkipped ||
+    unittestSkipped ||
+    (!SOME_TESTS_RAN.test(plain) && (ALL_SKIPPED.test(plain) || NODE_NONE_PASSED.test(plain)));
+  return noTests || goWithoutTests || cargoNonePassed || skipped ? "no_tests_ran" : "passed";
 }
+
+export const stripAnsi = (text: string): string => text.replace(ANSI, "");
 
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 const FAILURE_LINES = [
-  /^\s*--- FAIL: (\S+)/gm,
   /^FAILED (\S+)/gm,
   /^\s*FAIL\s+(.+ > .+?)\s*$/gm,
   /^\s*[×✕✗✖]\s+(.+?)(?:\s+\(?\d+(?:\.\d+)?\s*m?s\)?)?\s*$/gm,
   // Failures that are not a single test. Missing one of these would let a new one pass as old.
-  /^ERROR (\S+)/gm,
+  /^ERROR (\S+\.\w\S*)/gm,
   /^FAIL\s+(\S+)\s+\[(?:build|setup) failed\]/gm,
   /^\s*FAIL\s+(\S+\.\w+)(?:\s+\[.*\])?\s*$/gm,
   /^panic: (.+)$/gm,
 ];
 
+/**
+ * Go names a failure only by its function, and prints the package once that package has finished. Names
+ * are qualified with it, so the same name failing in another package is not the same failure.
+ */
+function goFailures(plain: string): string[] {
+  const names: string[] = [];
+  let pending: string[] = [];
+  for (const line of plain.split("\n")) {
+    const failed = line.match(/^\s*--- FAIL: (\S+)/);
+    if (failed) pending.push(failed[1]!);
+    const finished = line.match(/^FAIL\s+(\S+)\s+(?:\d[\d.]*s|\(cached\))\s*$/);
+    if (finished) {
+      names.push(...pending.map((name) => `${finished[1]}/${name}`));
+      pending = [];
+    }
+  }
+  return [...names, ...pending];
+}
+
 /** Test names a runner reports as failed. An empty list means the output could not be read that way. */
 export function failingTests(output: string): string[] {
-  const plain = output.replace(ANSI, "");
-  const names = FAILURE_LINES.flatMap((pattern) =>
-    [...plain.matchAll(pattern)].map((match) => sanitizeDisplay(match[1]!)),
-  );
+  const plain = stripAnsi(output);
+  const names = [
+    ...goFailures(plain),
+    ...FAILURE_LINES.flatMap((pattern) => [...plain.matchAll(pattern)].map((match) => match[1]!)),
+  ].map(sanitizeDisplay);
   const tests = names.filter((name) => name !== "failing tests:");
   return [...new Set(tests)].sort().slice(0, MAX_FAILURES);
 }
@@ -386,7 +522,7 @@ export async function runBaseline(options: VerifyOptions): Promise<BaselineRun[]
   await exportBase(workspace, runDir);
   const names = services.map((service) => service.name);
   for (const command of plan.verification.commands) assertLocalEnv(command, names);
-  const running = await startServices(services);
+  const running = await startServices(services, options.signal);
   const results: BaselineRun[] = [];
   try {
     for (const command of plan.verification.commands) {
@@ -405,7 +541,7 @@ export async function runBaseline(options: VerifyOptions): Promise<BaselineRun[]
       const output = await readFile(logPath, "utf8");
       results.push({
         name: command.name,
-        status: classify(command, result, output, false),
+        status: classifyRun(command, result, output, false),
         failures: failingTests(output),
         signature: failureSignature(output, runDir),
       });
@@ -461,7 +597,10 @@ export async function runVerification(options: VerifyOptions): Promise<CommandSu
     );
 
   const results: CommandSummary[] = [];
-  const running = await startServices(commands.some((item) => item.kind !== "install") ? services : []);
+  const running = await startServices(
+    commands.some((item) => item.kind !== "install") ? services : [],
+    options.signal,
+  );
   try {
     for (const command of commands) {
       stopIfCancelled(options.signal);
@@ -479,7 +618,7 @@ export async function runVerification(options: VerifyOptions): Promise<CommandSu
       const modified = await modifiedInRun(review, runDir, isLockFile);
       const failures = failingTests(output);
       const before = options.baseline?.find((item) => item.name === command.name);
-      let status = classify(command, result, output, modified.length > 0);
+      let status = classifyRun(command, result, output, modified.length > 0);
       // A failure the base commit already has is reported, not blamed on this work. A test run must name
       // what failed, since output that names nothing proves nothing. Any other command counts
       // only if its whole output matches the base, since a new error anywhere changes that.

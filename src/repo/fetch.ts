@@ -1,4 +1,4 @@
-import { mkdir, realpath, rename, rm } from "node:fs/promises";
+import { mkdir, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Config } from "../config.js";
@@ -13,6 +13,7 @@ import {
   toPosix,
   writeJsonAtomic,
 } from "../util/fsx.js";
+import { MAX_SNAPSHOT_FILES } from "./walk.js";
 
 export interface ParsedSource {
   kind: "remote" | "local";
@@ -40,7 +41,7 @@ export interface Snapshot {
   fetchedAt: string;
 }
 
-const SAFE_SEGMENT = /^[A-Za-z0-9._-]+$/;
+const SAFE_SEGMENT = /^(?!\.+$)[A-Za-z0-9._-]+$/;
 const SAFE_REF = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/;
 
 function assertRef(ref: string): string {
@@ -50,6 +51,9 @@ function assertRef(ref: string): string {
 
 export function parseSource(input: string, config: Config, allowLocal = false): ParsedSource {
   const value = input.trim();
+  if (/^[\\/]{2}/.test(value)) {
+    throw new TransplantError("invalid_source", `Network paths are not accepted: ${value}`);
+  }
   if (allowLocal && (path.isAbsolute(value) || /^[a-zA-Z]:[\\/]/.test(value))) {
     return {
       kind: "local",
@@ -125,6 +129,47 @@ export function parseSource(input: string, config: Config, allowLocal = false): 
     }
   }
   return parsed;
+}
+
+async function directoryBytes(directory: string): Promise<number> {
+  const entries = await readdir(directory, { recursive: true, withFileTypes: true });
+  const sizes = await Promise.all(
+    entries
+      .filter((entry) => entry.isFile())
+      .map((entry) =>
+        stat(path.join(entry.parentPath ?? directory, entry.name)).then(
+          (info) => info.size,
+          () => 0,
+        ),
+      ),
+  );
+  return sizes.reduce((total, size) => total + size, 0);
+}
+
+/** Aborts a download that grows past the limit, since the check before it starts is best effort. */
+export function watchSize(directory: string, limitMb: number, everyMs = 2000) {
+  const controller = new AbortController();
+  let over = false;
+  const timer = setInterval(() => {
+    directoryBytes(directory)
+      .then((bytes) => {
+        if (bytes / (1024 * 1024) <= limitMb) return;
+        over = true;
+        controller.abort();
+      })
+      .catch(() => undefined);
+  }, everyMs);
+  timer.unref();
+  return { signal: controller.signal, over: () => over, stop: () => clearInterval(timer) };
+}
+
+/** A ref can hold slashes, so a tree URL's subdirectory is whatever follows that ref. */
+function subdirAfterRef(source: ParsedSource, ref: string): string | undefined {
+  const parts = ref.split("/");
+  if (!source.treePath || !parts.every((part, index) => source.treePath![index] === part)) {
+    return source.subdir;
+  }
+  return source.treePath.slice(parts.length).join("/") || undefined;
 }
 
 async function assertRemoteSize(source: ParsedSource, config: Config): Promise<void> {
@@ -206,7 +251,7 @@ async function assertBlobTotal(directory: string, config: Config): Promise<void>
     if (Number.isFinite(size)) bytes += size;
     if (line) files++;
   }
-  if (bytes / (1024 * 1024) > config.maxRepoMb || files > 500_000) {
+  if (bytes / (1024 * 1024) > config.maxRepoMb || files > MAX_SNAPSHOT_FILES) {
     throw new TransplantError(
       "repo_too_large",
       `Checkout would be ${Math.round(bytes / (1024 * 1024))} MB across ${files} files, over the limit.`,
@@ -220,7 +265,9 @@ export async function fetchSnapshot(
   config: Config,
   options: { ref?: string; subdir?: string } = {},
 ): Promise<Snapshot> {
-  const fromUrl = options.ref ? { ref: options.ref, subdir: source.subdir } : await splitTreePath(source);
+  const fromUrl = options.ref
+    ? { ref: options.ref, subdir: subdirAfterRef(source, options.ref) }
+    : await splitTreePath(source);
   const ref = assertRef(fromUrl.ref ?? "HEAD");
   const subdir = options.subdir ?? fromUrl.subdir;
   if (subdir) assertSafeRelative(subdir);
@@ -236,11 +283,24 @@ export async function fetchSnapshot(
     for (const [key, value] of hardenedConfig(source.kind === "local")) {
       await git(["-C", temp, "config", key, value]);
     }
-    const remote = source.kind === "local" ? `file://${toPosix(source.url)}` : source.url;
+    // Git percent-decodes file URLs, so a name holding % could otherwise read a different folder.
+    const local = toPosix(source.url).replace(/[%?#]/g, (char) => encodeURIComponent(char));
+    const remote = source.kind === "local" ? `file://${local}` : source.url;
     await git(["-C", temp, "remote", "add", "origin", remote]);
+    const download = watchSize(temp, config.maxRepoMb);
     await git(["-C", temp, "fetch", "--depth=1", "--no-tags", "--no-recurse-submodules", "origin", ref], {
       timeoutMs,
-    });
+      signal: download.signal,
+    })
+      .catch((error: unknown) => {
+        if (!download.over()) throw error;
+        throw new TransplantError(
+          "repo_too_large",
+          `The download passed the ${config.maxRepoMb} MB limit.`,
+          "Raise RT_MAX_REPO_MB if this is intended.",
+        );
+      })
+      .finally(download.stop);
     const sha = (await git(["-C", temp, "rev-parse", "FETCH_HEAD^{commit}"])).stdout.trim();
     await assertBlobTotal(temp, config);
     await git(["-C", temp, "checkout", "-q", "--detach", "FETCH_HEAD"], { timeoutMs });
@@ -320,11 +380,24 @@ export async function cloneTarget(source: ParsedSource, config: Config, dest?: s
     throw new TransplantError("destination_exists", `Destination already exists: ${directory}`);
   }
   await mkdir(path.dirname(directory), { recursive: true });
+  if (source.kind === "remote") await assertRemoteSize(source, config);
   // `git -c` applies to this process only, so the writable checkout keeps normal behavior afterwards.
   const configArgs = hardenedConfig(false).flatMap(([key, value]) => ["-c", `${key}=${value}`]);
+  const download = watchSize(directory, config.maxRepoMb);
   await git(
     [...configArgs, "clone", "--filter=blob:none", "--no-recurse-submodules", "--", source.url, directory],
-    { timeoutMs: config.gitTimeoutMs },
-  );
+    { timeoutMs: config.gitTimeoutMs, signal: download.signal },
+  )
+    .catch(async (error: unknown) => {
+      // A failed clone leaves a folder, and the next attempt would refuse it as an existing destination.
+      await rm(directory, { recursive: true, force: true, maxRetries: 5 }).catch(() => undefined);
+      if (!download.over()) throw error;
+      throw new TransplantError(
+        "repo_too_large",
+        `The clone passed the ${config.maxRepoMb} MB limit.`,
+        "Raise RT_MAX_REPO_MB if this is intended.",
+      );
+    })
+    .finally(download.stop);
   return directory;
 }

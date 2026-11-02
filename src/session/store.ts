@@ -81,6 +81,8 @@ export interface Session {
   };
   license: LicenseReport;
   security: SecurityReport;
+  /** The whole repository's results from the start. The trace never overwrites them. */
+  repoScan?: { security: SecurityReport; license: LicenseReport };
   trace?: TraceResult;
   spec?: FeatureSpec;
   plan?: TransplantPlan;
@@ -136,8 +138,18 @@ export const newSessionId = (feature: string): string => {
 };
 
 export async function saveSession(config: Config, session: Session): Promise<void> {
+  const file = sessionFile(config, session.id);
+  // Two servers can share this folder, and the session lock only reaches one process.
+  const stored = await readJson<Session>(file).catch(() => null);
+  if (stored && stored.updatedAt !== session.updatedAt) {
+    throw new TransplantError(
+      "session_conflict",
+      "Another process changed this session.",
+      "Nothing was saved. Run this step again.",
+    );
+  }
   session.updatedAt = new Date().toISOString();
-  await writeJsonAtomic(sessionFile(config, session.id), session);
+  await writeJsonAtomic(file, session);
 }
 
 export async function loadSession(config: Config, id: string): Promise<Session> {

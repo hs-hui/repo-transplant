@@ -1,5 +1,6 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer, VERSION } from "./server.js";
+import { stopContainers } from "./session/verify.js";
 
 const HELP = `repo-transplant-mcp ${VERSION}
 
@@ -14,6 +15,8 @@ Environment:
   RT_MAX_OUTPUT_CHARS   Largest tool response (default 60000)
 `;
 
+const SHUTDOWN_LIMIT_MS = 5000;
+
 async function main(): Promise<void> {
   const flag = process.argv[2];
   if (flag === "--version" || flag === "-v") {
@@ -26,11 +29,25 @@ async function main(): Promise<void> {
   }
   const server = createServer();
   await server.connect(new StdioServerTransport());
+  let stopping = false;
   const shutdown = (): void => {
-    server.close().finally(() => process.exit(0));
+    if (stopping) return;
+    stopping = true;
+    // Taken before closing, because closing ends the runs that keep these names.
+    const stopped = Promise.race([
+      stopContainers(),
+      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_LIMIT_MS)),
+    ]);
+    server
+      .close()
+      .catch(() => undefined)
+      .then(() => stopped)
+      .finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  // Windows has no signal to catch when a client stops a server, but clients end stdin first.
+  process.stdin.once("end", shutdown);
 }
 
 main().catch((error) => {

@@ -48,6 +48,18 @@ const JS = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"];
 const upper = (index: number) => (match: RegExpMatchArray) => (match[index] ?? "ANY").toUpperCase();
 const group = (index: number) => (match: RegExpMatchArray) => match[index] ?? "";
 
+/** The path in Spring mapping arguments: the first string, or the constant it names in braces. */
+function springPath(args: string | undefined): string {
+  const named = args?.replace(
+    /\b(method|produces|consumes|headers|params|name)\s*=\s*(\[[^\]]*\]|\{[^}]*\}|[^,]+)/g,
+    "",
+  );
+  const literal = named?.match(/"([^"]*)"/)?.[1];
+  if (literal !== undefined) return literal;
+  const constant = named?.replace(/\b(value|path)\s*=\s*/g, "").replace(/[\s,[\]{}]/g, "");
+  return constant ? `{${constant}}` : "";
+}
+
 const ROUTE_PATTERNS: RoutePattern[] = [
   {
     style: "express_like",
@@ -108,9 +120,14 @@ const ROUTE_PATTERNS: RoutePattern[] = [
   },
   {
     style: "spring",
-    pattern: /@(Get|Post|Put|Patch|Delete|Request)Mapping\(\s*(?:value\s*=\s*|path\s*=\s*)?"?([^")]*)"?/g,
-    method: upper(1),
-    path: group(2),
+    pattern: /@(Get|Post|Put|Patch|Delete|Request)Mapping\b(?:\(([^)]*)\))?/g,
+    method: (match) =>
+      match[1] === "Request"
+        ? (
+            match[2]?.match(/\bmethod\s*=\s*[[{]?\s*(?:RequestMethod\.)?(\w+)/)?.[1] ?? "REQUEST"
+          ).toUpperCase()
+        : match[1]!.toUpperCase(),
+    path: (match) => springPath(match[2]),
     extensions: [".java", ".kt"],
   },
   {
@@ -214,7 +231,7 @@ function declaredEnvNames(rel: string, text: string): string[] {
   if (ENV_FILE.test(rel)) {
     return [...text.matchAll(/^\s*(?:export\s+)?([A-Z][A-Z0-9_]+)\s*=/gm)].map((match) => match[1]!);
   }
-  const settings = text.search(/class\s+\w+\(\s*BaseSettings\s*\)/);
+  const settings = text.search(/class\s+\w+\([^)\n]*\bBaseSettings\b[^)\n]*\)/);
   return settings === -1 ? [] : [...text.slice(settings).matchAll(SETTINGS_FIELD)].map((match) => match[1]!);
 }
 
@@ -263,6 +280,14 @@ function controllerPrefix(text: string): string {
   return text.match(/@Controller\(\s*['"`]([^'"`]*)['"`]\s*\)/)?.[1] ?? "";
 }
 
+/** Spring's class-level @RequestMapping, which every method route below it starts from. */
+function springPrefix(text: string): { path: string; index: number } | null {
+  const match = text.match(
+    /@RequestMapping\(([^)]*)\)\s*(?:@\w+(?:\([^)]*\))?\s*)*(?:(?:public|abstract|final|open|data|internal)\s+)*class\b/,
+  );
+  return match ? { path: springPath(match[1]).replace(/\/$/, ""), index: match.index! } : null;
+}
+
 const MAX_ROWS = 300;
 
 /** Finds the server-side surface a feature touches: routes, data, env, jobs, realtime and services. */
@@ -301,6 +326,7 @@ export function scanBackend(graph: RepoGraph, files?: string[]): BackendSurface 
 
     routes.push(...fileBasedRoute(rel, text));
     const prefix = controllerPrefix(text);
+    const spring = springPrefix(text);
     const pythonPrefix = ext === ".py" ? routerPrefix(text) : "";
     const lines = text.split("\n");
     for (const rule of ROUTE_PATTERNS) {
@@ -308,14 +334,18 @@ export function scanBackend(graph: RepoGraph, files?: string[]): BackendSurface 
       if (rule.style === "django_urls" && path.posix.basename(rel) !== "urls.py") continue;
       if (rule.style === "rails_routes" && !rel.endsWith("routes.rb")) continue;
       for (const match of text.matchAll(rule.pattern)) {
+        if (rule.style === "spring" && match.index === spring?.index) continue;
         const line = lineAt(match.index);
         const nearby = lines.slice(Math.max(0, line - 3), line + 6).join("\n");
+        const springPath = `${spring?.path ?? ""}${rule.path(match)}`;
         routes.push({
           method: rule.method(match),
           path:
             rule.style === "nest"
               ? `/${[prefix, rule.path(match)].filter(Boolean).join("/")}`
-              : `${pythonPrefix}${rule.path(match)}`,
+              : rule.style === "spring"
+                ? springPath
+                : `${pythonPrefix}${rule.path(match)}`,
           file: rel,
           line,
           style: rule.style,

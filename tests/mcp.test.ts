@@ -4,30 +4,34 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ElicitRequestSchema, ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { PNG } from "pngjs";
 import { describe, expect, it } from "vitest";
 import type { Config } from "../src/config.js";
 import { createServer } from "../src/server.js";
 import { createRepo, MIT_TEXT, tempDir, testConfig, writeFiles } from "./helpers.js";
 
-type Elicit = "accept" | "decline" | "cancel" | "error" | null;
+type Elicit = "accept" | "decline" | "cancel" | "error" | "timeout" | "url-only" | null;
 
 async function connect(
   elicit: Elicit = null,
   overrides: Partial<Config> = {},
-  answerAfterMs: () => number = () => 0,
+  // A person takes a moment to read a dialog, and an instant yes is not taken for theirs.
+  answerAfterMs: () => number = () => (elicit === "accept" ? 700 : 0),
 ) {
   const config = { ...testConfig(), ...overrides };
   const server = createServer(config);
   const client = new Client(
     { name: "test", version: "1.0.0" },
-    { capabilities: elicit ? { elicitation: {} } : {} },
+    {
+      capabilities: elicit === "url-only" ? { elicitation: { url: {} } } : elicit ? { elicitation: {} } : {},
+    },
   );
   if (elicit) {
     client.setRequestHandler(ElicitRequestSchema, async () => {
       await new Promise((resolve) => setTimeout(resolve, answerAfterMs()));
       if (elicit === "error") throw new Error("client failed");
+      if (elicit === "timeout") throw new McpError(ErrorCode.RequestTimeout, "Request timed out");
       return elicit === "accept" ? { action: "accept", content: { approve: true } } : { action: elicit };
     });
   }
@@ -67,6 +71,7 @@ const SPEC = {
 };
 
 const PLAN = {
+  out_of_scope_reason: "README.md is documentation, and the feature does not use it.",
   approach: "Port it.",
   files: [
     {
@@ -103,6 +108,24 @@ async function plannedSession(call: Awaited<ReturnType<typeof connect>>["call"])
 }
 
 describe("MCP surface", () => {
+  it("keeps repo_read_file within the output limit and says where it stopped", async () => {
+    const { call, raw } = await connect(null, { maxOutputChars: 2000 });
+    const repository = createRepo({ "long.txt": "x".repeat(5000), "many.txt": "line\n".repeat(2000) });
+    const { snapshot_id } = await call("repo_fetch", { repository, allow_local: true });
+    const read = async (path: string, extra: Record<string, unknown> = {}) => {
+      const result = await raw("repo_read_file", { snapshot_id, path, ...extra });
+      return (result.content as { text: string }[])[0]!.text;
+    };
+    const long = await read("long.txt");
+    expect(long.length).toBeLessThan(2800);
+    expect(long).toContain("cut at the output limit");
+    const many = await read("many.txt");
+    expect(many.length).toBeLessThan(2800);
+    const next = many.match(/continue from line (\d+)/)?.[1];
+    expect(Number(next)).toBeGreaterThan(100);
+    expect(await read("many.txt", { start_line: Number(next) })).toContain(`${next}\tline`);
+  });
+
   it("registers documented, annotated tools", async () => {
     const { client } = await connect();
     const { tools } = await client.listTools();
@@ -240,12 +263,59 @@ describe("approval through the client", () => {
     await expect(attempt()).rejects.toThrow(/refused this plan/);
   });
 
-  it("treats a client error as a no, however fast", async () => {
+  it("does not take an instant yes for a person's", async () => {
+    const { call } = await connect("accept", {}, () => 0);
+    const { session_id, plan_hash } = await plannedSession(call);
+    const approved = await call("transplant_approve", { session_id, plan_hash, user_confirmation: "yes" });
+    expect(approved.approved_via).toBe("agent_attested");
+  });
+
+  it("refuses an instant yes when a dialog is required", async () => {
+    const { call } = await connect("accept", { requireDialog: true }, () => 0);
+    const { session_id, plan_hash } = await plannedSession(call);
+    await expect(
+      call("transplant_approve", { session_id, plan_hash, user_confirmation: "yes" }),
+    ).rejects.toThrow(/dialog_required/);
+  });
+
+  it("uses the user's words when the client offers no form dialog", async () => {
+    const { call } = await connect("url-only");
+    const { session_id, plan_hash } = await plannedSession(call);
+    const approved = await call("transplant_approve", { session_id, plan_hash, user_confirmation: "yes" });
+    expect(approved.approved_via).toBe("agent_attested");
+  });
+
+  it("lets go of a dialog when the call is cancelled", async () => {
+    const { client, call } = await connect("accept", {}, () => 30_000);
+    const { session_id, plan_hash } = await plannedSession(call);
+    const controller = new AbortController();
+    const pending = client.callTool(
+      { name: "transplant_approve", arguments: { session_id, plan_hash, user_confirmation: "yes" } },
+      undefined,
+      { signal: controller.signal },
+    );
+    setTimeout(() => controller.abort(), 200);
+    await expect(pending).rejects.toBeDefined();
+    await expect(call("transplant_status", { session_id })).resolves.toBeDefined();
+  });
+
+  it("does not count an unanswered dialog as a refusal", async () => {
+    const { call } = await connect("timeout", {}, () => 600);
+    const { session_id, plan_hash } = await plannedSession(call);
+    await expect(
+      call("transplant_approve", { session_id, plan_hash, user_confirmation: "yes" }),
+    ).rejects.toThrow(/dialog_timeout/);
+    await expect(
+      call("transplant_approve", { session_id, plan_hash, user_confirmation: "yes" }),
+    ).rejects.toThrow(/dialog_timeout/);
+  });
+
+  it("treats a client error as no answer at all", async () => {
     const { call } = await connect("error");
     const { session_id, plan_hash } = await plannedSession(call);
     await expect(
       call("transplant_approve", { session_id, plan_hash, user_confirmation: "the agent says yes" }),
-    ).rejects.toThrow(/not_approved/);
+    ).rejects.toThrow(/dialog_failed/);
   });
 
   it("shows one dialog at a time, so an open one cannot make another look unattended", async () => {

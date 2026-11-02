@@ -94,12 +94,15 @@ export const Migration = z.object({
   destructive_reason: z.string().optional(),
 });
 
+/** Keys are plain names. One holding `=` would set a variable the check on names never saw. */
+const EnvRecord = z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string()).default({});
+
 export const VerificationCommand = z.object({
   name: z.string().regex(/^[a-z0-9][a-z0-9_-]*$/),
   command: text,
   kind: z.enum(["install", "typecheck", "lint", "test", "build", "migration", "e2e", "other"]),
   timeout_s: z.number().int().positive().max(3600).default(600),
-  env: z.record(z.string(), z.string()).default({}),
+  env: EnvRecord,
 });
 
 const ImageReference = z.string().regex(/^[a-z0-9][a-z0-9._/:@-]{0,200}$/i, "Must be an image reference");
@@ -110,7 +113,7 @@ const VerificationService = z.object({
     .regex(/^[a-z][a-z0-9-]{0,30}$/)
     .describe("Host name that commands use to reach it."),
   image: ImageReference,
-  env: z.record(z.string(), z.string()).default({}),
+  env: EnvRecord,
   ready_command: z
     .string()
     .min(1)
@@ -123,7 +126,7 @@ export const TransplantPlan = z.object({
   dependencies: z.object({
     add: z.array(PlannedDependency).default([]),
     reuse: z.array(text).default([]),
-    dropped: z.array(text).default([]),
+    dropped: z.array(text).default([]).describe("Packages this plan removes from the target's manifests."),
   }),
   wiring: z.array(text).default([]),
   design_mapping: z.array(text).default([]),
@@ -144,6 +147,11 @@ export const TransplantPlan = z.object({
       .min(10)
       .optional()
       .describe("Why a plan that changes UI files has no e2e command. The user sees this before approving."),
+    install_scripts_reason: z
+      .string()
+      .min(10)
+      .optional()
+      .describe("Why an npm, pnpm, yarn or bun install runs without --ignore-scripts. The user sees this."),
   }),
   risks: z.array(text).default([]),
   rollback: text,
@@ -151,6 +159,12 @@ export const TransplantPlan = z.object({
     .string()
     .optional()
     .describe("Required when the plan touches CI, agent configuration or install hooks."),
+  out_of_scope_reason: z
+    .string()
+    .optional()
+    .describe(
+      "Required when the whole-repository scan flags a file the trace leaves out. Say why the feature does not use it.",
+    ),
 });
 export type TransplantPlan = z.infer<typeof TransplantPlan>;
 
@@ -163,6 +177,10 @@ export const EvidenceInput = z.object({
     .string()
     .optional()
     .describe("Exact text, such as the test name, that must appear in that command's log."),
+  screenshot_path: z
+    .string()
+    .optional()
+    .describe("Image that proves a visual criterion, absolute or relative to the worktree."),
   detail: text,
 });
 export type EvidenceInput = z.infer<typeof EvidenceInput>;

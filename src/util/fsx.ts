@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { TransplantError } from "./errors.js";
 
@@ -72,23 +72,76 @@ export function isBinary(buffer: Buffer): boolean {
   return sample.includes(0);
 }
 
-/** Reads a UTF-8 text file, returning null when it is binary, oversized or unreadable. */
+/** What real text does not hold. Random bytes behind a byte order mark decode to this. */
+const NOT_TEXT = /[\u0000-\u0008\u000E-\u001F]|\p{Cs}/u;
+
+/** Decodes UTF-8 or byte-order-marked UTF-16, returning null for binary content. */
+export function decodeText(buffer: Buffer): string | null {
+  const little = buffer[0] === 0xff && buffer[1] === 0xfe;
+  if (!little && !(buffer[0] === 0xfe && buffer[1] === 0xff)) {
+    return isBinary(buffer) ? null : buffer.toString("utf8");
+  }
+  if (little && buffer[2] === 0 && buffer[3] === 0) return null;
+  const even = buffer.subarray(0, buffer.length & ~1);
+  const text = (little ? even : Buffer.from(even).swap16()).toString("utf16le").slice(1);
+  return NOT_TEXT.test(text) ? null : text;
+}
+
+/** Reads a text file, returning null when it is binary, oversized or unreadable. */
 export async function readText(file: string, maxBytes: number): Promise<string | null> {
   try {
     const info = await stat(file);
     if (!info.isFile() || info.size > maxBytes) return null;
-    const buffer = await readFile(file);
-    return isBinary(buffer) ? null : buffer.toString("utf8");
+    return decodeText(await readFile(file));
   } catch {
     return null;
   }
 }
 
-export async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
+/** Reads the start of a file of any size as text, for headers. */
+export async function readHead(file: string, bytes: number): Promise<string | null> {
+  try {
+    const handle = await open(file, "r");
+    try {
+      const { buffer, bytesRead } = await handle.read(Buffer.alloc(bytes), 0, bytes, 0);
+      return decodeText(buffer.subarray(0, bytesRead));
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+const BUSY_RENAME = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/** Replaces a file in one step. Windows refuses a rename while another process has the file open. */
+export async function writeFileAtomic(file: string, content: string | Buffer): Promise<void> {
   await mkdir(path.dirname(file), { recursive: true });
+  // A folder in the way is not going to clear up, so it should not be waited for.
+  if ((await stat(file).catch(() => null))?.isDirectory()) {
+    throw new TransplantError("not_a_file", `${file} is a folder.`);
+  }
   const temp = `${file}.${randomId()}.tmp`;
-  await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rename(temp, file);
+  try {
+    await writeFile(temp, content);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await rename(temp, file);
+        return;
+      } catch (error) {
+        if (attempt >= 8 || !BUSY_RENAME.has((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25 * 2 ** attempt));
+      }
+    }
+  } catch (error) {
+    await rm(temp, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
+  await writeFileAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 export async function readJson<T>(file: string): Promise<T> {
@@ -133,12 +186,15 @@ export function parseJsonc<T = unknown>(text: string): T | null {
       i = text.indexOf("*/", i + 2);
       if (i === -1) break;
       i++;
+    } else if (ch === "}" || ch === "]") {
+      // A trailing comma is dropped here, outside strings, where it cannot be part of a value.
+      out = `${out.replace(/,\s*$/, "")}${ch}`;
     } else {
       out += ch;
     }
   }
   try {
-    return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1")) as T;
+    return JSON.parse(out) as T;
   } catch {
     return null;
   }

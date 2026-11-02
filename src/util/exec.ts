@@ -159,6 +159,7 @@ export interface GitOptions {
   env?: NodeJS.ProcessEnv;
   /** For calls that use no network or credentials. They keep only the safe environment. */
   local?: boolean;
+  signal?: AbortSignal;
 }
 
 /** Names the subcommand in errors, skipping options and the values of -c and -C. */
@@ -172,7 +173,7 @@ function label(args: string[]): string {
 export async function git(args: string[], options: GitOptions = {}): Promise<ExecResult> {
   const timeoutMs = options.timeoutMs ?? 120_000;
   const env = gitEnv(options.env, options.local);
-  const result = await exec("git", args, { cwd: options.cwd, env, timeoutMs });
+  const result = await exec("git", args, { cwd: options.cwd, env, timeoutMs, signal: options.signal });
   if (result.timedOut) {
     throw new TransplantError("git_timeout", `${label(args)} timed out after ${timeoutMs}ms`);
   }

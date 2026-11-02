@@ -1,7 +1,13 @@
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type { ServerNotification, ServerRequest, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
+import {
+  ErrorCode,
+  McpError,
+  type ServerNotification,
+  type ServerRequest,
+  type ToolAnnotations,
+} from "@modelcontextprotocol/sdk/types.js";
 import { type ZodRawShape, z } from "zod";
 import { scanBackend } from "./analysis/backend.js";
 import { assessFeasibility } from "./analysis/feasibility.js";
@@ -17,6 +23,7 @@ import { compareScreenshots } from "./analysis/visual.js";
 import { type Config, loadConfig } from "./config.js";
 import { cloneTarget, fetchSnapshot, loadSnapshot, parseSource } from "./repo/fetch.js";
 import { IGNORED_DIRS, walkRepo } from "./repo/walk.js";
+import { leftOutOf } from "./session/report.js";
 import { EvidenceInput, FeatureSpec, TransplantPlan } from "./session/schema.js";
 import { listSessions, loadSession, sessionDir, withSessionLock } from "./session/store.js";
 import { checkUpstream, listProvenance } from "./session/upstream.js";
@@ -86,10 +93,14 @@ function untrustedBlock(label: string, body: string): string {
   ].join("\n");
 }
 
+/** Room kept for the labels and markers around a file's text. */
+const BLOCK_OVERHEAD = 400;
+
 function formatOutput(value: unknown, maxChars: number): string {
   const json = JSON.stringify(value, null, 2);
   if (json.length <= maxChars) return json;
-  return `${json.slice(0, maxChars)}\n... [output truncated at ${maxChars} characters; narrow the request]`;
+  const note = `\n... [output truncated at ${maxChars} characters; narrow the request]`;
+  return `${json.slice(0, Math.max(0, maxChars - note.length))}${note}`;
 }
 
 function formatError(error: unknown): string {
@@ -141,9 +152,10 @@ export function createServer(config: Config = loadConfig()): McpServer {
   let dialogs: Promise<unknown> = Promise.resolve();
 
   /** Puts a decision to the user directly when the client can. Returns null when it cannot. */
-  async function ask(message: string): Promise<"elicitation" | null> {
-    if (!server.server.getClientCapabilities()?.elicitation) return null;
+  async function ask(message: string, signal?: AbortSignal): Promise<"elicitation" | null> {
+    if (!server.server.getClientCapabilities()?.elicitation?.form) return null;
     const asked = performance.now();
+    let failure: unknown;
     const answer = await server.server
       .elicitInput(
         {
@@ -154,14 +166,34 @@ export function createServer(config: Config = loadConfig()): McpServer {
             required: ["approve"],
           },
         },
-        { timeout: DIALOG_TIMEOUT_MS },
+        { timeout: DIALOG_TIMEOUT_MS, signal },
       )
-      .catch(() => null);
+      .catch((error: unknown) => {
+        failure = error;
+        return null;
+      });
+    // None of these is an answer, so none of them may be remembered as the user's no.
+    if (signal?.aborted) throw new TransplantError("cancelled", "Cancelled, and nothing was decided.");
+    if (failure) {
+      const timedOut = failure instanceof McpError && failure.code === ErrorCode.RequestTimeout;
+      throw new TransplantError(
+        timedOut ? "dialog_timeout" : "dialog_failed",
+        timedOut ? "Nobody answered the dialog in time." : "The dialog could not be shown.",
+        "Nothing was decided. Ask the user, then call this again.",
+      );
+    }
     // Some clients advertise elicitation and answer within milliseconds without showing anything:
-    // headless Claude Code cancels, and an app on the Agent SDK with no dialog handler declines. A
-    // person's cancel or decline has to stay a no, so only speed tells them apart.
-    const refused = answer?.action === "cancel" || answer?.action === "decline";
-    if (refused && performance.now() - asked < NO_PERSON_MS && !config.requireDialog) return null;
+    // headless Claude Code cancels, an app on the Agent SDK with no dialog handler declines, and an
+    // automated handler can accept. Only speed tells these from a person, who has to read the dialog.
+    const fast = performance.now() - asked < NO_PERSON_MS;
+    if (fast && !config.requireDialog) return null;
+    if (fast && answer?.action === "accept") {
+      throw new TransplantError(
+        "dialog_required",
+        "That answer came too fast to be a person's.",
+        "A person has to read the dialog and answer it.",
+      );
+    }
     if (answer?.action !== "accept" || answer.content?.approve !== true) {
       throw new TransplantError("not_approved", "The user did not approve.");
     }
@@ -179,10 +211,10 @@ export function createServer(config: Config = loadConfig()): McpServer {
   }
 
   /** One dialog at a time, so a second request cannot be cancelled by the first one being open. */
-  function askUser(message: string): Promise<"elicitation" | null> {
+  function askUser(message: string, signal?: AbortSignal): Promise<"elicitation" | null> {
     const turn = dialogs.then(
-      () => ask(message),
-      () => ask(message),
+      () => ask(message, signal),
+      () => ask(message, signal),
     );
     dialogs = turn.catch(() => undefined);
     return turn;
@@ -339,13 +371,34 @@ export function createServer(config: Config = loadConfig()): McpServer {
         throw new TransplantError("unreadable_file", `${rel} is binary or over the size limit.`);
       const lines = text.split("\n");
       const end = Math.min(end_line ?? start_line + 1999, lines.length);
-      const body = lines
-        .slice(start_line - 1, end)
-        .map((line, index) => `${start_line + index}\t${line}`)
-        .join("\n");
+      // Cut here rather than on the finished block, which has to keep its end marker. Revealed
+      // characters take more room than the bytes they stand for, so rows are measured after that.
+      const room = Math.max(1, config.maxOutputChars - BLOCK_OVERHEAD);
+      const shown: string[] = [];
+      let size = 0;
+      let last = start_line - 1;
+      let cut = false;
+      while (last < end) {
+        const row = revealHidden(`${last + 1}\t${lines[last]}`);
+        if (size + row.length > room) {
+          if (shown.length > 0) break;
+          shown.push(row.slice(0, room));
+          cut = true;
+          last++;
+          break;
+        }
+        shown.push(row);
+        size += row.length + 1;
+        last++;
+      }
+      const stopped = cut
+        ? `, line ${last} is cut at the output limit and this tool cannot read the rest of it`
+        : last < end
+          ? `, stopped at the output limit, so continue from line ${last + 1}`
+          : "";
       return untrustedBlock(
-        `${snapshot.url}@${snapshot.sha.slice(0, 12)}:${rel}, lines ${start_line}-${end} of ${lines.length}`,
-        revealHidden(body),
+        `${snapshot.url}@${snapshot.sha.slice(0, 12)}:${rel}, lines ${start_line}-${last} of ${lines.length}${stopped}`,
+        shown.join("\n"),
       );
     },
   );
@@ -548,7 +601,7 @@ export function createServer(config: Config = loadConfig()): McpServer {
   tool(
     "transplant_trace",
     "Fix feature scope",
-    "Records the feature's closure in the session, and re-runs the license and security checks on exactly those files.",
+    "Records the feature's closure in the session, and re-runs the license and security checks on exactly those files. The start-time scan of the whole repository still applies: files it flags outside this closure are listed as flagged_outside_trace, and the plan must trace them or give out_of_scope_reason.",
     {
       session_id: SESSION_ID,
       seeds: z.array(z.string()).min(1),
@@ -568,6 +621,7 @@ export function createServer(config: Config = loadConfig()): McpServer {
         ...sessionSummary(session),
         trace: session.trace,
         security_findings: session.security.findings.slice(0, 40),
+        flagged_outside_trace: leftOutOf(session, []).files.slice(0, 40),
       };
     },
   );
@@ -620,7 +674,7 @@ export function createServer(config: Config = loadConfig()): McpServer {
         .describe("The user's decision when the security scan is dangerous."),
     },
     LOCAL_WRITE,
-    async ({ session_id, plan_hash, user_confirmation, license_override, security_override }) => {
+    async ({ session_id, plan_hash, user_confirmation, license_override, security_override }, signal) => {
       const session = await loadSession(config, session_id);
       // Checked before asking, so what the dialog shows is what the hash covers.
       if (!session.plan || session.planHash !== plan_hash) {
@@ -636,8 +690,11 @@ export function createServer(config: Config = loadConfig()): McpServer {
       ].filter(Boolean);
       const asked = await askUser(
         ["Approve this transplant?", "", approvalSummary(session), "", ...overrides].join("\n"),
+        signal,
       ).catch(async (error: unknown) => {
-        await recordRefusal(config, session_id, plan_hash);
+        if (error instanceof TransplantError && error.code === "not_approved") {
+          await recordRefusal(config, session_id, plan_hash);
+        }
         throw error;
       });
       if (!asked && session.refusedPlans?.includes(plan_hash)) {
@@ -918,10 +975,10 @@ export function createServer(config: Config = loadConfig()): McpServer {
     {
       before_path: z.string(),
       after_path: z.string(),
-      diff_path: z.string().describe("Where to write the diff PNG."),
+      diff_path: z.string().describe("Where to write the diff PNG. An existing file must be a PNG."),
       threshold: z.number().min(0).max(1).default(0.1),
     },
-    LOCAL_WRITE,
+    { ...LOCAL_WRITE, destructiveHint: true },
     async ({ before_path, after_path, diff_path, threshold }) =>
       compareScreenshots(before_path, after_path, diff_path, threshold),
   );
