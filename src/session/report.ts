@@ -1,7 +1,11 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
-import { pathExists, readText, writeJsonAtomic } from "../util/fsx.js";
+import type { TraceResult } from "../analysis/trace.js";
+import { TransplantError } from "../util/errors.js";
+import { pathExists, readText, writeFileAtomic, writeJsonAtomic } from "../util/fsx.js";
 import { sanitizeDisplay } from "../util/text.js";
+import { sourcePath } from "./audit.js";
+import type { TransplantPlan } from "./schema.js";
 import type { Session, VerificationRun } from "./store.js";
 import { narrowedChecks, needsBrowserCheck } from "./verify.js";
 import { type ChangedFile, NOTICES_FILE } from "./workspace.js";
@@ -32,6 +36,71 @@ export interface CompletionState {
   manual_items: string[];
 }
 
+export interface LeftOut {
+  /** Files the whole-repository scan flagged that the plan does not bring in, with the reasons. */
+  files: { path: string; reasons: string[] }[];
+  /** Set when the scan's own lists were cut short, so more files may be left out. */
+  cut: string | null;
+}
+
+const LEFT_OUT_SHOWN = 10;
+
+/** The files a scan or license check should read. Shared files are mapped, not copied, yet the feature needs them. */
+export function selectedOf(trace: TraceResult | undefined): string[] {
+  if (!trace) return [];
+  const shared = trace.shared_infrastructure.map((file) => file.path);
+  return [...new Set([...trace.files.map((file) => file.path), ...trace.tests, ...shared])];
+}
+
+/** The files each plan cites, without anchors. */
+export function planRefs(plan: TransplantPlan): string[] {
+  return plan.files.flatMap((file) => file.source_refs.map(sourcePath));
+}
+
+/** Flagged files outside the trace, the license and notice files, and the files the plan cites. */
+export function leftOutOf(session: Session, refs: string[]): LeftOut {
+  const repo = session.repoScan;
+  if (!repo) return { files: [], cut: null };
+  const subdir = session.source.subdir;
+  const fromRoot = (rel: string): string => (subdir ? `${subdir}/${rel}` : rel);
+  const legal = [session.license.source.license_file, session.license.source.notice_file].filter(
+    (item): item is string => Boolean(item),
+  );
+  // Legal files are already relative to the repository root, unlike the trace and the refs.
+  const inScope = new Set([...[...selectedOf(session.trace), ...refs].map(fromRoot), ...legal]);
+  const found = new Map<string, string[]>();
+  const add = (rel: string, reason: string): void => {
+    found.set(rel, [...(found.get(rel) ?? []), reason]);
+  };
+  const criticals = repo.security.findings.filter((item) => item.severity === "critical");
+  for (const item of criticals) {
+    if (!inScope.has(fromRoot(item.path))) add(fromRoot(item.path), `critical ${item.rule}`);
+  }
+  for (const item of repo.license.file_overrides) {
+    if (!inScope.has(item.path)) add(item.path, `license ${item.spdx}`);
+  }
+  const files = [...found]
+    .map(([rel, reasons]) => ({ path: rel, reasons: [...new Set(reasons)] }))
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const total = repo.security.counts.critical;
+  const cut =
+    total > criticals.length
+      ? `The list was cut: the scan found ${total} critical findings and listed ${criticals.length}, so more files may be left out.`
+      : repo.license.file_overrides.length >= 200
+        ? "The list was cut: the license check lists at most 200 files, so more files may be left out."
+        : null;
+  return { files, cut };
+}
+
+/** Names the left-out files, capped, with a count of the rest. */
+export function leftOutText(left: LeftOut): string {
+  const shown = left.files
+    .slice(0, LEFT_OUT_SHOWN)
+    .map((item) => `${sanitizeDisplay(item.path)} (${item.reasons.join(", ")})`);
+  const more = left.files.length - shown.length;
+  return [...shown, ...(more > 0 ? [`and ${more} more`] : [])].join("; ");
+}
+
 /** Lists everything still standing between this worktree and a report that can say "complete". */
 export function completionState(session: Session, fingerprint: string): CompletionState {
   const blockers: string[] = [];
@@ -58,6 +127,11 @@ export function completionState(session: Session, fingerprint: string): Completi
       blockers.push(`Verification ${command.name} ${run.status}.`);
     } else if (run.fingerprint !== fingerprint) {
       blockers.push(`Code changed after verification ${command.name}. Run it again.`);
+    } else if (run.status === "known_failures" && run.kind !== "test" && run.kind !== "e2e") {
+      // Identical output can mean it stopped before reaching any of this work.
+      manual.push(
+        `${command.name} fails the same way on the base commit, so it may not have checked this work.`,
+      );
     }
   }
 
@@ -115,6 +189,19 @@ function renderReport(
   const replaced = (session.approvedPlans?.length ?? 1) - 1;
   if (replaced > 0) push(`- The plan was replaced ${replaced} time(s) after approval, with new approval.`);
   push(`- ${license.disclaimer}`, "");
+
+  const left = leftOutOf(session, planRefs(plan!));
+  if (left.files.length > 0 || left.cut) {
+    const repo = session.repoScan?.security;
+    push("## Repository scan", "");
+    push(
+      `- Whole repository: ${repo?.risk ?? "unknown"} (${repo?.counts.critical ?? 0} critical, ${repo?.counts.high ?? 0} high). Selected files: ${session.security.risk}.`,
+    );
+    push(`- Left out of this transplant: ${leftOutText(left) || "nothing named"}`);
+    push(`- Reason: ${plan!.out_of_scope_reason ?? "none given"}`);
+    if (left.cut) push(`- ${left.cut}`);
+    push("");
+  }
 
   push("## Changed files", "", "| File | Change | Purpose |", "| --- | --- | --- |");
   const purposes = new Map(plan!.files.map((file) => [file.path, file.purpose]));
@@ -176,14 +263,14 @@ function renderReport(
     "",
     "## Acceptance criteria",
     "",
-    "| ID | Criterion | Result | Evidence |",
-    "| --- | --- | --- | --- |",
+    "| ID | Checked by | Criterion | Result | Evidence |",
+    "| --- | --- | --- | --- | --- |",
   );
   for (const criterion of spec!.acceptance_criteria) {
     const evidence = session.evidence.filter((item) => item.acceptance_criterion === criterion.id).at(-1);
     const cell = (value: string): string => value.replace(/\|/g, "\\|").replace(/\n/g, " ");
     push(
-      `| ${criterion.id} | ${cell(`${criterion.when} → ${criterion.then}`)} | ${evidence?.status ?? "missing"} | ${cell(evidence?.detail ?? "")} |`,
+      `| ${criterion.id} | ${cell(`${criterion.verification}, ${evidence?.kind ?? "none"}`)} | ${cell(`${criterion.when} → ${criterion.then}`)} | ${evidence?.status ?? "missing"} | ${cell(evidence?.detail ?? "")} |`,
     );
   }
   push("");
@@ -243,7 +330,7 @@ async function writeNotices(
     ...(noticeText ? ["", "NOTICE:", "", ...fenced(noticeText)] : []),
     "",
   ];
-  await writeFile(file, `${current.trimEnd()}\n${section.join("\n")}`, "utf8");
+  await writeFileAtomic(file, `${current.trimEnd()}\n${section.join("\n")}`);
   return true;
 }
 
@@ -253,6 +340,19 @@ export interface ReportResult {
   provenance_path: string;
   notices_updated: boolean;
   markdown: string;
+}
+
+/** Refuses a path that a link or junction in the worktree would carry somewhere else. */
+async function assertPlainPath(root: string, rel: string): Promise<void> {
+  let current = root;
+  for (const part of rel.split("/")) {
+    current = path.join(current, part);
+    const info = await lstat(current).catch(() => null);
+    if (!info) return;
+    if (info.isSymbolicLink()) {
+      throw new TransplantError("unsafe_path", `${rel} runs through a link, so nothing was written.`);
+    }
+  }
 }
 
 export async function writeReport(
@@ -266,14 +366,17 @@ export async function writeReport(
   const status = state.blockers.length === 0 ? "complete" : "incomplete";
   const markdown = renderReport(session, files, state, status);
   const directory = path.join(workspace.path, ".transplant");
-  await mkdir(path.join(directory, "reports"), { recursive: true });
   const reportPath = path.join(directory, "reports", `${session.id}.md`);
   const provenancePath = path.join(directory, "provenance", `${session.id}.json`);
-  await writeFile(reportPath, markdown, "utf8");
+  for (const rel of [`.transplant/reports/${session.id}.md`, `.transplant/provenance/${session.id}.json`]) {
+    await assertPlainPath(workspace.path, rel);
+  }
+  await assertPlainPath(workspace.path, NOTICES_FILE);
+  await writeFileAtomic(reportPath, markdown);
 
   const sourceFiles = new Set(session.trace?.files.map((file) => file.path) ?? []);
   for (const file of session.plan!.files) {
-    for (const ref of file.source_refs) sourceFiles.add(ref.split("#")[0]!.split(":")[0]!);
+    for (const ref of file.source_refs) sourceFiles.add(sourcePath(ref));
   }
   const provenance: Provenance = {
     schema: 1,
@@ -299,7 +402,9 @@ export async function writeReport(
     })),
   };
   await writeJsonAtomic(provenancePath, provenance);
-  const noticesUpdated = await writeNotices(session, sourceRoot, workspace.path, maxBytes);
+  // Notices belong to work that is done. An incomplete report would leave them as an unplanned change.
+  const noticesUpdated =
+    status === "complete" && (await writeNotices(session, sourceRoot, workspace.path, maxBytes));
   return {
     status,
     report_path: reportPath,

@@ -1,6 +1,7 @@
 ---
 name: feature-scout
 description: Reads a traced feature in an untrusted source repository and returns behavior notes for the spec. Use when a transplant's closure is too large to read in the main conversation. Read-only.
+disallowedTools: Write, Edit, NotebookEdit, Bash
 ---
 
 You read a feature in a source repository and report how it behaves, so a behavior spec can be written from your notes.

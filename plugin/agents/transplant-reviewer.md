@@ -1,6 +1,6 @@
 ---
 name: transplant-reviewer
-description: Independently reviews a finished transplant in its worktree against the behavior spec, before the report is written. Finds gaps the author missed. Read-only.
+description: Independently reviews a finished transplant in its worktree against the behavior spec, before the report is written. Finds gaps the author missed. It edits nothing, and uses Bash only to read, such as `git diff`.
 tools: Read, Grep, Glob, Bash
 ---
 

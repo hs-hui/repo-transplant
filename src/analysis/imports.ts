@@ -147,57 +147,110 @@ function extractSfcScripts(text: string): { code: string; ext: string; offset: n
   return scripts;
 }
 
-/** Folds parenthesized import lists onto one line, keeping the statement's line number. */
+/** Drops a # comment, unless the # is inside a quoted string. */
+function stripPythonComment(line: string): string {
+  let quote = "";
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index]!;
+    if (quote) {
+      if (char === "\\") index++;
+      else if (char === quote) quote = "";
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === "#") {
+      return line.slice(0, index);
+    }
+  }
+  return line;
+}
+
+const CONTINUED = /\\[ \t]*$/;
+
+/** Blanks triple-quoted strings, whose text can look exactly like an import. */
+function withoutPythonBlockStrings(lines: string[]): string[] {
+  let open = "";
+  return lines.map((line) => {
+    let kept = "";
+    let rest = line;
+    while (true) {
+      if (open) {
+        const end = rest.indexOf(open);
+        if (end === -1) return kept;
+        rest = rest.slice(end + 3);
+        open = "";
+      }
+      const next = rest.match(/"""|'''|#/);
+      if (!next || next[0] === "#") return kept + rest;
+      kept += rest.slice(0, next.index);
+      rest = rest.slice(next.index! + 3);
+      open = next[0];
+    }
+  });
+}
+
+/** Folds parenthesized import lists and backslash continuations, keeping the statement's line number. */
 function foldPythonLines(text: string): string[] {
-  const lines = text.split("\n");
+  const lines = withoutPythonBlockStrings(text.split("\n")).map(stripPythonComment);
   const folded: string[] = [];
   for (let index = 0; index < lines.length; index++) {
-    let line = lines[index]!;
-    if (/^\s*from\s+\S+\s+import\s*\(/.test(line) && !line.includes(")")) {
-      const start = index;
-      while (index + 1 < lines.length && index - start < 500) {
-        index++;
-        line += ` ${lines[index]}`;
-        if (lines[index]!.includes(")")) break;
-      }
-      folded.push(line);
-      for (let blank = start; blank < index; blank++) folded.push("");
-      continue;
+    // Only the newest line is looked at, so a statement that never closes stays linear.
+    const parts = [lines[index]!];
+    const start = index;
+    let open = /^\s*from\s+\S+\s+import\s*\(/.test(parts[0]!) && !parts[0]!.includes(")");
+    while (index + 1 < lines.length && (open || CONTINUED.test(parts.at(-1)!))) {
+      parts[parts.length - 1] = parts.at(-1)!.replace(CONTINUED, "");
+      index++;
+      parts.push(lines[index]!);
+      open &&= !lines[index]!.includes(")");
     }
-    folded.push(line);
+    folded.push(parts.join(" "));
+    for (let blank = start; blank < index; blank++) folded.push("");
   }
   return folded;
+}
+
+/** Splits `import a; import b` and drops the header of `if x: import a`, so each statement stands alone. */
+function pythonStatements(line: string): string[] {
+  return line
+    .split(";")
+    .map((part) =>
+      part.replace(
+        /^\s*(?:(?:if|elif|else|try|except|finally|with|for|while)\b[^:]*:\s*)+(?=from\b|import\b)/,
+        "",
+      ),
+    );
 }
 
 function parsePythonImports(text: string): RawImport[] {
   const imports: RawImport[] = [];
   const lines = foldPythonLines(text);
   for (let index = 0; index < lines.length; index++) {
-    const line = lines[index]!;
-    const from = line.match(/^\s*from\s+([.\w]+)\s+import\s+(.+)$/);
-    if (from) {
-      imports.push({ specifier: from[1]!, kind: "static", line: index + 1 });
-      const names = from[2]!.replace(/[()]/g, "").split("#")[0]!.split(",");
-      for (const name of names) {
-        const symbol = name
-          .trim()
-          .split(/\s+as\s+/)[0]!
-          .trim();
-        if (/^\w+$/.test(symbol)) {
-          const prefix = from[1]!.endsWith(".") ? from[1]! : `${from[1]}.`;
-          imports.push({ specifier: `${prefix}${symbol}`, kind: "module", line: index + 1 });
+    for (const line of pythonStatements(lines[index]!)) {
+      const from = line.match(/^\s*from\s+([.\w]+)\s+import\s+(.+)$/);
+      if (from) {
+        imports.push({ specifier: from[1]!, kind: "static", line: index + 1 });
+        const names = from[2]!.replace(/[()]/g, "").split(",");
+        for (const name of names) {
+          const symbol = name
+            .trim()
+            .split(/\s+as\s+/)[0]!
+            .trim();
+          if (/^\w+$/.test(symbol)) {
+            const prefix = from[1]!.endsWith(".") ? from[1]! : `${from[1]}.`;
+            imports.push({ specifier: `${prefix}${symbol}`, kind: "module", line: index + 1 });
+          }
         }
+        continue;
       }
-      continue;
-    }
-    const plain = line.match(/^\s*import\s+(.+)$/);
-    if (plain) {
-      for (const part of plain[1]!.split("#")[0]!.split(",")) {
-        const name = part
-          .trim()
-          .split(/\s+as\s+/)[0]!
-          .trim();
-        if (/^[\w.]+$/.test(name)) imports.push({ specifier: name, kind: "static", line: index + 1 });
+      const plain = line.match(/^\s*import\s+(.+)$/);
+      if (plain) {
+        for (const part of plain[1]!.split(",")) {
+          const name = part
+            .trim()
+            .split(/\s+as\s+/)[0]!
+            .trim();
+          if (/^[\w.]+$/.test(name)) imports.push({ specifier: name, kind: "static", line: index + 1 });
+        }
       }
     }
   }
@@ -224,15 +277,114 @@ function parseGoImports(text: string): RawImport[] {
   return imports;
 }
 
+const RUST_MAX_LEAVES = 4096;
+const RUST_MAX_PATH = 512;
+
+/** Spells out a use tree: `a::{b, c::{d, self}}` gives a::b, a::c::d and a::c. */
+function expandRustUse(tree: string, budget: { leaves: number }, prefix = "", depth = 0): string[] {
+  const group = tree.indexOf("{");
+  if (depth > 16 || prefix.length > RUST_MAX_PATH || budget.leaves <= 0) return [];
+  if (group === -1) {
+    budget.leaves--;
+    const name = tree.replace(/\s+as\s+\w+$/, "").trim();
+    const spec = name === "self" ? prefix.slice(0, -2) : `${prefix}${name}`.replace(/(::\*|::)$/, "");
+    return spec ? [spec] : [];
+  }
+  const head = `${prefix}${tree.slice(0, group).trim()}`;
+  const branches: string[] = [];
+  let nested = 0;
+  let from = group + 1;
+  const end = tree.lastIndexOf("}");
+  for (let index = from; index < end; index++) {
+    const char = tree[index];
+    if (char === "{") nested++;
+    if (char === "}") nested--;
+    if (char === "," && nested === 0) {
+      branches.push(tree.slice(from, index));
+      from = index + 1;
+    }
+  }
+  branches.push(tree.slice(from, end));
+  return branches
+    .filter((item) => item.trim())
+    .flatMap((item) => expandRustUse(item.trim(), budget, head, depth + 1));
+}
+
+/** Tells how many inline `mod x { }` blocks surround an offset. Offsets must be asked for in order. */
+function inlineModuleDepth(text: string): (offset: number) => number {
+  const opens = new Set<number>();
+  for (const match of text.matchAll(/\bmod\s+\w+\s*\{/g)) opens.add(match.index + match[0].length - 1);
+  const changes: [number, number][] = [];
+  const stack: boolean[] = [];
+  let depth = 0;
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code === 123) {
+      stack.push(opens.has(index));
+      if (opens.has(index)) changes.push([index, ++depth]);
+    } else if (code === 125 && stack.pop()) {
+      changes.push([index, --depth]);
+    }
+  }
+  let next = 0;
+  let current = 0;
+  return (offset) => {
+    while (next < changes.length && changes[next]![0] < offset) current = changes[next++]![1];
+    return current;
+  };
+}
+
+/** Inside an inline module, `super` names something in this same file before it leaves the file. */
+function outOfInlineModules(spec: string, depth: number): string | null {
+  const parts = spec.split("::");
+  let climbed = 0;
+  while (climbed < depth && parts[0] === "super") {
+    parts.shift();
+    climbed++;
+  }
+  if (climbed === 0) return spec;
+  if (parts.length === 0) return null;
+  return parts[0] === "super" ? parts.join("::") : `self::${parts.join("::")}`;
+}
+
+const RUST_PREFIX = String.raw`^[ \t]*(?:#\[[^\]\n]*\][ \t]*)*(?:pub(?:\([^)\n]*\))?\s+)?`;
+const RUST_USE = new RegExp(String.raw`${RUST_PREFIX}use\s+([\s\S]+)`, "m");
+const RUST_MOD = new RegExp(String.raw`${RUST_PREFIX}mod\s+(\w+)\s*(?![\s\S])`, "m");
+
+/** A use tree can span lines, so statements are found by their semicolons rather than line by line. */
 function parseRustImports(text: string): RawImport[] {
   const imports: RawImport[] = [];
-  const lines = text.split("\n");
-  lines.forEach((line, index) => {
-    const use = line.match(/^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([\w:]+)/);
-    if (use) imports.push({ specifier: use[1]!.replace(/::$/, ""), kind: "static", line: index + 1 });
-    const mod = line.match(/^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;/);
-    if (mod) imports.push({ specifier: `mod:${mod[1]}`, kind: "module", line: index + 1 });
-  });
+  const statements = text.split(";");
+  const local = new Set<string>();
+  for (const match of text.matchAll(/\bmod\s+(\w+)\s*[;{]/g)) local.add(match[1]!);
+  const depthAt = inlineModuleDepth(text);
+  let offset = 0;
+  let line = 1;
+  const lineAt = (position: number): number => {
+    for (; offset < position; offset++) if (text.charCodeAt(offset) === 10) line++;
+    return line;
+  };
+  let start = 0;
+  for (const statement of statements) {
+    const use = statement.match(RUST_USE);
+    const mod = use ? null : statement.match(RUST_MOD);
+    if (use) {
+      const position = start + use.index!;
+      const at = lineAt(position);
+      const depth = depthAt(position);
+      const tree = use[1]!.replace(/\/\/[^\n]*/g, "");
+      for (const spec of expandRustUse(tree, { leaves: RUST_MAX_LEAVES })) {
+        const head = spec.split("::")[0]!;
+        // Types and macro paths such as `$crate` are never crates.
+        if (/^[$A-Z]/.test(head)) continue;
+        const specifier = outOfInlineModules(local.has(head) ? `self::${spec}` : spec, depth);
+        if (specifier) imports.push({ specifier, kind: "static", line: at });
+      }
+    } else if (mod) {
+      imports.push({ specifier: `mod:${mod[1]}`, kind: "module", line: lineAt(start + mod.index!) });
+    }
+    start += statement.length + 1;
+  }
   return imports;
 }
 

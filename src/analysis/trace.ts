@@ -134,6 +134,16 @@ export function traceFeature(graph: RepoGraph, options: TraceOptions): TraceResu
       truncated ||= (graph.nodes.get(current)?.internal.size ?? 0) > 0;
       continue;
     }
+    // A package compiles as a whole, so its own files stay in however widely they are used.
+    for (const dep of graph.nodes.get(current)?.samePackage ?? []) {
+      if (depths.has(dep) || isExcluded(dep)) continue;
+      if (depths.size >= maxFiles) {
+        truncated = true;
+        continue;
+      }
+      depths.set(dep, depth + 1);
+      queue.push(dep);
+    }
     for (const dep of graph.nodes.get(current)?.internal ?? []) {
       if (depths.has(dep)) continue;
       if (isExcluded(dep)) {
@@ -213,6 +223,7 @@ export function traceFeature(graph: RepoGraph, options: TraceOptions): TraceResu
     limitations: [
       "Dependencies through framework conventions, such as Rails autoloading, Django settings strings or dependency-injection containers, are not import edges. Check integration_points and read the entry files.",
       "C# usings are not resolved to files.",
+      "Kotlin files that declare several classes, Rust #[path] modules and two classes with one fully qualified name can be missed.",
     ],
   };
 }

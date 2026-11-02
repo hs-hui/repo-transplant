@@ -53,6 +53,8 @@ export interface RepoProfile {
   has_backend: boolean;
   has_frontend: boolean;
   suggested_commands: SuggestedCommand[];
+  /** The same commands for a Linux container, whatever this machine runs. */
+  suggested_docker_commands: SuggestedCommand[];
   /** Images that have this project's toolchain, for checks this machine cannot run itself. */
   suggested_docker_image: string | null;
   /** Databases the project uses, ready to paste into verification.services. */
@@ -392,10 +394,10 @@ async function suggestDockerImage(root: string, names: Set<string>): Promise<str
   return null;
 }
 
-function pythonRunner(names: Set<string>): string {
+function pythonRunner(names: Set<string>, windows: boolean): string {
   if (names.has("uv.lock")) return "uv run python";
   if (names.has("poetry.lock")) return "poetry run python";
-  return process.platform === "win32" ? ".venv\\Scripts\\python" : ".venv/bin/python";
+  return windows ? ".venv\\Scripts\\python" : ".venv/bin/python";
 }
 
 function pythonInstall(names: Set<string>, python: string): string {
@@ -404,9 +406,13 @@ function pythonInstall(names: Set<string>, python: string): string {
   const requirements = ["requirements-dev.txt", "dev-requirements.txt", "requirements.txt"].find((file) =>
     names.has(file),
   );
-  // Wheels only, which is pip's nearest match to --ignore-scripts: nothing runs setup.py.
-  const packages = requirements ? `--only-binary=:all: -r ${requirements}` : "-e .";
-  return `python -m venv .venv && ${python} -m pip install ${packages}`;
+  // Wheels only, which is pip's nearest match to --ignore-scripts: nothing runs setup.py. Installing
+  // the project itself does run its build, and there is nothing to install without a project file.
+  const venv = "python -m venv .venv";
+  if (requirements) return `${venv} && ${python} -m pip install --only-binary=:all: -r ${requirements}`;
+  return names.has("pyproject.toml") || names.has("setup.py")
+    ? `${venv} && ${python} -m pip install -e .`
+    : venv;
 }
 
 function suggestCommands(
@@ -414,6 +420,7 @@ function suggestCommands(
   scripts: Record<string, string>,
   names: Set<string>,
   dependencies: Dependency[],
+  windows: boolean,
 ): SuggestedCommand[] {
   const commands: SuggestedCommand[] = [];
   const add = (name: string, command: string, kind: SuggestedCommand["kind"]): void => {
@@ -433,8 +440,8 @@ function suggestCommands(
     const pick = (candidates: string[]): string | undefined => candidates.find((script) => scripts[script]);
     const typecheck = pick(["typecheck", "type-check", "check-types", "tsc"]);
     if (typecheck) add("typecheck", `${run} ${typecheck}`, "typecheck");
-    else if (dependencies.some((dep) => dep.name === "typescript"))
-      add("typecheck", "npx tsc --noEmit", "typecheck");
+    else if (dependencies.some((dep) => dep.name === "typescript" && dep.manifest === "package.json"))
+      add("typecheck", "npx --no-install tsc --noEmit", "typecheck");
     const lint = pick(["lint"]);
     if (lint) add("lint", `${run} ${lint}`, "lint");
     const test = pick(["test:ci", "test:unit", "test"]);
@@ -444,7 +451,7 @@ function suggestCommands(
   }
   const isPython = names.has("pyproject.toml") || names.has("requirements.txt") || names.has("manage.py");
   // Checks run in a fresh directory, so a Python project needs its packages installed there too.
-  const python = pythonRunner(names);
+  const python = pythonRunner(names, windows);
   if (isPython) add("install", pythonInstall(names, python), "install");
   if (names.has("pyproject.toml") || names.has("requirements.txt")) {
     if (dependencies.some((dep) => dep.name === "pytest")) add("test", `${python} -m pytest -q`, "test");
@@ -461,15 +468,20 @@ function suggestCommands(
     add("typecheck", "cargo check --all-targets", "typecheck");
     add("test", "cargo test", "test");
   }
-  if (names.has("Gemfile")) add("test", "bundle exec rspec", "test");
-  if (names.has("composer.json")) add("test", "vendor/bin/phpunit", "test");
-  const isWindows = process.platform === "win32";
+  if (names.has("Gemfile")) {
+    add("install", "bundle install", "install");
+    add("test", "bundle exec rspec", "test");
+  }
+  if (names.has("composer.json")) {
+    add("install", "composer install --no-scripts", "install");
+    add("test", "vendor/bin/phpunit", "test");
+  }
   if (names.has("pom.xml")) {
-    const maven = names.has("mvnw") ? (isWindows ? "mvnw.cmd" : "./mvnw") : "mvn";
+    const maven = names.has("mvnw") ? (windows ? "mvnw.cmd" : "./mvnw") : "mvn";
     add("test", `${maven} -q test`, "test");
   }
   if (names.has("build.gradle") || names.has("build.gradle.kts"))
-    add("test", isWindows ? "gradlew.bat test" : "./gradlew test", "test");
+    add("test", windows ? "gradlew.bat test" : "./gradlew test", "test");
   return commands;
 }
 
@@ -502,10 +514,8 @@ export async function profileRepo(root: string, maxFileBytes: number): Promise<R
   if (files.some((file) => file.ext === ".module.css" || file.rel.endsWith(".module.css")))
     addStack("styling", "css-modules");
 
-  const packageJsonPath = path.join(root, "package.json");
-  const rootPackage = (await pathExists(packageJsonPath))
-    ? parseJsonc<Record<string, unknown>>(await readFile(packageJsonPath, "utf8"))
-    : null;
+  const rootPackageText = await readText(path.join(root, "package.json"), maxFileBytes);
+  const rootPackage = rootPackageText ? parseJsonc<Record<string, unknown>>(rootPackageText) : null;
   const scripts = (rootPackage?.scripts ?? {}) as Record<string, string>;
 
   const packages = manifests
@@ -541,7 +551,14 @@ export async function profileRepo(root: string, maxFileBytes: number): Promise<R
       stack.backend_framework?.length || stack.orm?.length || allNames.has("schema.prisma"),
     ),
     has_frontend: Boolean(stack.ui_framework?.length || stack.meta_framework?.length),
-    suggested_commands: suggestCommands(packageManager, scripts, rootNames, dependencies),
+    suggested_commands: suggestCommands(
+      packageManager,
+      scripts,
+      rootNames,
+      dependencies,
+      process.platform === "win32",
+    ),
+    suggested_docker_commands: suggestCommands(packageManager, scripts, rootNames, dependencies, false),
     suggested_docker_image: await suggestDockerImage(root, rootNames),
     suggested_services: await suggestServices(root, files, dependencies),
     infrastructure: detectInfrastructure(files),

@@ -1,7 +1,7 @@
 import { readdir } from "node:fs/promises";
 import path from "node:path";
-import { walkRepo } from "../repo/walk.js";
-import { parseJsonc, pathExists, readText } from "../util/fsx.js";
+import { type FileClass, walkRepo } from "../repo/walk.js";
+import { assertSafeRelative, parseJsonc, pathExists, readHead, readText } from "../util/fsx.js";
 
 export type LicenseClass =
   | "public_domain"
@@ -30,6 +30,8 @@ const CLASS_BY_ID: Record<string, LicenseClass> = {
   Zlib: "permissive",
   "BSL-1.0": "permissive",
   "CC-BY-4.0": "permissive",
+  "Unicode-3.0": "permissive",
+  "Unicode-DFS-2016": "permissive",
   "MPL-2.0": "weak_copyleft",
   "LGPL-2.1": "weak_copyleft",
   "LGPL-3.0": "weak_copyleft",
@@ -61,7 +63,7 @@ const GNU_TITLES: { id: string; title: string; version: string }[] = [
 ];
 
 /** Ordered: BSD-3 contains the BSD-2 phrasing. */
-const FINGERPRINTS: { id: string; all: string[] }[] = [
+const FINGERPRINTS: { id: string; all: string[]; none?: string[] }[] = [
   { id: "SSPL-1.0", all: ["server side public license"] },
   { id: "BUSL-1.1", all: ["business source license"] },
   { id: "FSL-1.1", all: ["functional source license"] },
@@ -76,6 +78,8 @@ const FINGERPRINTS: { id: string; all: string[] }[] = [
   { id: "CC0-1.0", all: ["cc0 1.0 universal"] },
   { id: "Unlicense", all: ["free and unencumbered software released into the public domain"] },
   { id: "BSL-1.0", all: ["boost software license"] },
+  { id: "Unicode-3.0", all: ["unicode license v3"] },
+  { id: "Unicode-3.0", all: ["unicode, inc. license agreement"] },
   { id: "Zlib", all: ["altered source versions must be plainly marked as such"] },
   {
     id: "BSD-3-Clause",
@@ -85,9 +89,19 @@ const FINGERPRINTS: { id: string; all: string[] }[] = [
     id: "BSD-2-Clause",
     all: ["redistribution and use in source and binary forms"],
   },
+  // These two are told apart by name only. Reading a shortened MIT as MIT-0 would drop its conditions.
+  { id: "MIT-0", all: ["mit no attribution"] },
   { id: "MIT", all: ["permission is hereby granted, free of charge", "the software is provided"] },
+  {
+    id: "0BSD",
+    all: ["permission to use, copy, modify, and", "distribute this software for any purpose"],
+    none: ["provided that the above copyright notice"],
+  },
   { id: "ISC", all: ["permission to use, copy, modify, and", "distribute this software for any purpose"] },
 ];
+
+/** A GNU title stands alone on its line, which tells a license from a sentence that cites one. */
+const GNU_TITLE_LINE = /^\s*GNU (AFFERO |LESSER )?GENERAL PUBLIC LICENSE\s*\n\s*Version (\d(?:\.\d)?)/gm;
 
 const SPDX_ALIASES: Record<string, string> = {
   "APACHE 2.0": "Apache-2.0",
@@ -135,9 +149,12 @@ interface Resolved {
   rank: number;
 }
 
+/** The old Cargo spelling of a choice, as in MIT/Apache-2.0. */
+const withoutSlashes = (expression: string): string => expression.replace(/\s*\/\s*/g, " OR ");
+
 /** Parses an SPDX expression by precedence: AND binds tighter than OR, and parentheses override both. */
 function parseExpression(expression: string): Resolved {
-  const tokens = expression.match(/[()]|[^\s()]+/g) ?? [];
+  const tokens = withoutSlashes(expression).match(/[()]|[^\s()]+/g) ?? [];
   let position = 0;
   const leaf = (raw: string): Resolved => {
     const spdx = normalizeSpdx(raw);
@@ -182,25 +199,46 @@ export function resolveExpression(expression: string): { spdx: string; class: Li
 }
 
 function expressionLeaves(expression: string): string[] {
-  return (expression.match(/[^\s()]+/g) ?? [])
+  return (withoutSlashes(expression).match(/[^\s()]+/g) ?? [])
     .filter((token) => !/^(AND|OR|WITH)$/i.test(token))
     .map(normalizeSpdx);
 }
 
-export function identifyLicenseText(text: string): string | null {
-  const normalized = text
-    .toLowerCase()
-    .replace(/[\u201c\u201d]/g, '"')
-    .replace(/[\u2018\u2019]/g, "'")
-    .replace(/\s+/g, " ");
+/** Every license a text contains. One file can hold several, such as a project's and a bundled library's. */
+export function identifyLicenseTexts(text: string): string[] {
+  // Notices often sit in a comment block.
+  const plain = text.replace(/^[ \t]*(?:#|\/\/|\*|;|--)[ \t]?/gm, "");
+  const normalized = plain.toLowerCase().replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/\s+/g, " ");
   const head = normalized.slice(0, 600);
-  for (const { id, title, version } of GNU_TITLES) {
-    if (head.includes(title) && head.includes(version)) return id;
+  const ids = new Set<string>();
+  const gnu = GNU_TITLES.find(({ title, version }) => head.includes(title) && head.includes(version));
+  if (gnu) ids.add(gnu.id);
+  for (const match of plain.matchAll(GNU_TITLE_LINE)) {
+    const title = `gnu ${(match[1] ?? "").toLowerCase()}general public license`;
+    const found = GNU_TITLES.find(
+      (item) =>
+        item.title === title &&
+        (!item.version ||
+          item.version.endsWith(match[2]!.split(".")[0]!) ||
+          item.version.endsWith(match[2]!)),
+    );
+    if (found) ids.add(found.id);
   }
-  for (const fingerprint of FINGERPRINTS) {
-    if (fingerprint.all.every((phrase) => normalized.includes(phrase))) return fingerprint.id;
+  for (const { id, all, none } of FINGERPRINTS) {
+    const present = all.every((phrase) => normalized.includes(phrase));
+    if (present && !none?.some((phrase) => normalized.includes(phrase))) ids.add(id);
   }
-  return null;
+  // These texts contain the phrases of their weaker or stricter neighbor.
+  if (ids.has("BSD-3-Clause")) ids.delete("BSD-2-Clause");
+  if (ids.has("MIT-0")) ids.delete("MIT");
+  if (ids.has("0BSD")) ids.delete("ISC");
+  return [...ids];
+}
+
+/** The strictest license in a text, or null when none is recognized. */
+export function identifyLicenseText(text: string): string | null {
+  const rank = (id: string): number => RESTRICTIVENESS.indexOf(classify(id));
+  return identifyLicenseTexts(text).sort((a, b) => rank(b) - rank(a))[0] ?? null;
 }
 
 export interface LicenseInfo {
@@ -215,7 +253,8 @@ export interface LicenseInfo {
   conflict: string | null;
 }
 
-const LICENSE_FILE = /^(LICEN[CS]E|COPYING|UNLICENSE)([.-][A-Za-z0-9.-]+)?(\.(md|txt|rst))?$/i;
+const LICENSE_FILE =
+  /^(?!.*\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|php|c|h|css|html?|json|ya?ml|toml)$)(?:(?:LICEN[CS]E|COPYING|UNLICENSE)(?:[._-][A-Za-z0-9._-]+)?|[A-Za-z0-9.-]+[-_](?:LICEN[CS]E|COPYING)(?:\.(?:md|txt|rst))?)$/i;
 
 async function declaredLicenses(
   repoRoot: string,
@@ -272,14 +311,29 @@ export async function detectLicense(root: string, dir: string, maxBytes: number)
     const entries = (await readdir(absolute, { withFileTypes: true })).sort((a, b) =>
       a.name < b.name ? -1 : 1,
     );
-    for (const entry of entries) {
+    // REUSE projects keep every license in LICENSES/, named by its identifier.
+    const reuse = entries.some((entry) => entry.isDirectory() && entry.name === "LICENSES")
+      ? await readdir(path.join(absolute, "LICENSES"), { withFileTypes: true })
+      : [];
+    const named = [
+      ...entries.map((entry) => ({ entry, rel: entry.name })),
+      ...reuse.map((entry) => ({ entry, rel: `LICENSES/${entry.name}` })),
+    ];
+    for (const { entry, rel: inside } of named) {
       if (!entry.isFile()) continue;
-      const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
+      const rel = relDir ? `${relDir}/${inside}` : inside;
       if (/^NOTICE(\.[a-z]+)?$/i.test(entry.name) && !info.notice_file) info.notice_file = rel;
-      if (!LICENSE_FILE.test(entry.name)) continue;
+      if (!LICENSE_FILE.test(entry.name) && !inside.startsWith("LICENSES/")) continue;
       const text = await readText(path.join(root, rel), maxBytes);
+      if (text === null) {
+        // A license nobody can read is not the same as no license, so a manifest cannot speak over it.
+        info.license_file ??= rel;
+        info.evidence.push({ kind: "license_text", path: rel, value: "unreadable" });
+        textIds.push("unrecognized");
+        continue;
+      }
       if (!text) continue;
-      const id = identifyLicenseText(text);
+      const ids = identifyLicenseTexts(text);
       info.license_file ??= rel;
       if (info.copyright.length === 0) {
         info.copyright = [...text.matchAll(/^.{0,200}copyright\s+(\(c\)|\u00a9|\d{4}).{0,200}$/gim)]
@@ -287,8 +341,8 @@ export async function detectLicense(root: string, dir: string, maxBytes: number)
           .slice(0, 5);
       }
       if (/commons clause/i.test(text)) info.commons_clause = true;
-      info.evidence.push({ kind: "license_text", path: rel, value: id ?? "unrecognized" });
-      textIds.push(id ?? "unrecognized");
+      info.evidence.push({ kind: "license_text", path: rel, value: ids.join(", ") || "unrecognized" });
+      textIds.push(...(ids.length > 0 ? ids : ["unrecognized"]));
     }
     if (info.license_file) break;
   }
@@ -303,8 +357,12 @@ export async function detectLicense(root: string, dir: string, maxBytes: number)
     info.class = classify(info.spdx);
   }
 
+  // A manifest speaks for its own folder, so the one that counts sits beside the license that won.
+  const licenseDir = info.license_file ? path.posix.dirname(info.license_file) : ".";
+  const stop = chain.indexOf(licenseDir === "." ? "" : licenseDir.replace(/\/?LICENSES$/, ""));
+  const manifestDirs = stop === -1 ? chain : chain.slice(0, stop + 1);
   let declared: { path: string; value: string }[] = [];
-  for (const relDir of chain) {
+  for (const relDir of manifestDirs) {
     declared = await declaredLicenses(root, relDir, maxBytes);
     if (declared.length > 0) break;
   }
@@ -318,8 +376,14 @@ export async function detectLicense(root: string, dir: string, maxBytes: number)
     }
     const resolved = resolveExpression(entry.value);
     if (!info.license_file) {
-      info.spdx = resolved.spdx;
-      info.class = resolved.class;
+      // With no text to settle it, manifests that disagree mean the strictest one, for a person to check.
+      if (info.spdx && info.spdx !== resolved.spdx) {
+        info.conflict = `${entry.path} says ${entry.value}, but another manifest says ${info.spdx}.`;
+      }
+      if (!info.spdx || rank(resolved.spdx) > rank(info.spdx)) {
+        info.spdx = resolved.spdx;
+        info.class = resolved.class;
+      }
       continue;
     }
     if (info.class === "unknown") {
@@ -327,10 +391,19 @@ export async function detectLicense(root: string, dir: string, maxBytes: number)
       continue;
     }
     const leaves = expressionLeaves(entry.value);
-    if (known.every((id) => leaves.includes(id))) {
-      // A dual-licensed manifest explains which of its texts may be chosen.
-      info.spdx = resolved.spdx;
-      info.class = resolved.class;
+    const stricter = known.filter((id) => !leaves.includes(id) && rank(id) > rank(resolved.spdx));
+    const covered = known.length === 0 || known.some((id) => leaves.includes(id));
+    if (covered && stricter.length === 0) {
+      // A dual-licensed manifest explains which of its texts may be chosen. Between equals, the one
+      // with a text in the repository is the one to use.
+      const chosen = known.includes(resolved.spdx)
+        ? resolved.spdx
+        : (known.find((id) => leaves.includes(id) && rank(id) === rank(resolved.spdx)) ?? resolved.spdx);
+      info.spdx = chosen;
+      info.class = classify(chosen);
+      if (known.length > 0 && !known.includes(chosen)) {
+        info.conflict = `${entry.path} says ${entry.value}, but the repository has no license text for ${chosen}.`;
+      }
     } else {
       info.conflict = `${entry.path} says ${entry.value}, but the license text is ${known.join(", ")}.`;
     }
@@ -351,6 +424,8 @@ export interface FileLicenseOverride {
 }
 
 const SPDX_HEADER = /SPDX-License-Identifier:\s*([^\r\n*]+)/;
+/** Past the header a tag only counts in a comment, since source can mention one in a string. */
+const SPDX_COMMENT = /^\s*(?:\/\/|#|\/\*+|\*|<!--|--|;|%)\s*SPDX-License-Identifier:\s*([^\r\n*]+)/m;
 
 export interface LicenseReport {
   source: LicenseInfo;
@@ -472,6 +547,8 @@ function judge(
   }
 }
 
+/** A test or stylesheet is as copyable as a source file, and a directory name decides nothing. */
+const LICENSED_CLASSES = new Set<FileClass>(["source", "test", "style"]);
 const VERDICT_ORDER: LicenseVerdict[] = ["allow", "allow_with_conditions", "needs_review", "block"];
 
 export interface LicenseCheckOptions {
@@ -515,18 +592,18 @@ export async function checkLicense(
   const selected =
     options.paths ??
     (await walkRepo(sourceRoot))
-      .filter((file) => file.fileClass === "source")
-      .map((file) => file.rel)
-      .slice(0, 2000);
+      .filter((file) => LICENSED_CLASSES.has(file.fileClass))
+      .map((file) => file.rel);
   for (const rel of selected) {
-    const text = await readText(path.join(sourceRoot, rel), options.maxFileBytes);
-    const header = text?.slice(0, 2000).match(SPDX_HEADER);
+    assertSafeRelative(rel);
+    const file = path.join(sourceRoot, rel);
+    const text = (await readText(file, options.maxFileBytes)) ?? (await readHead(file, 2000));
+    const header = text?.slice(0, 2000).match(SPDX_HEADER) ?? text?.match(SPDX_COMMENT);
     if (header) {
       const resolved = resolveExpression(header[1]!.trim());
       if (resolved.spdx !== source.spdx) {
         overrides.push({ path: rel, spdx: resolved.spdx, class: resolved.class, source: "spdx_header" });
       }
-      continue;
     }
     if (!options.paths) continue;
     const dir = path.posix.dirname(rel);

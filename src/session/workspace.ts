@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
+import { rmSync } from "node:fs";
 import {
   appendFile,
   copyFile,
   lstat,
   mkdir,
+  mkdtemp,
   readdir,
   readFile,
   readlink,
@@ -15,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { TransplantError } from "../util/errors.js";
 import { type ExecResult, git } from "../util/exec.js";
-import { isBinary, mapLimit, pathExists, randomId, sha256 } from "../util/fsx.js";
+import { decodeText, isBinary, mapLimit, pathExists, randomId, sha256 } from "../util/fsx.js";
 import { normalizeNewlines } from "../util/text.js";
 import { SESSION_SUFFIX } from "./store.js";
 
@@ -24,7 +26,8 @@ const GIT_TIMEOUT_MS = 300_000;
 const FILE_CONCURRENCY = 32;
 const LOCKED_CONFIG = ["-c", `core.hooksPath=${os.devNull}`, "-c", "core.fsmonitor=false"];
 /** Settings people change in the normal course of work, which cannot start anything. */
-const ROUTINE_SETTING = /^(branch\.|user\.|gc\.|maintenance\.|remote\.[^\n]*\.(url|pushurl|fetch)\n)/i;
+const ROUTINE_SETTING =
+  /^(branch\.|user\.|gc\.(?!recentobjectshook\n)|maintenance\.|remote\.[^\n]*\.(url|pushurl|fetch)\n)/i;
 const LFS_FILTER = /^git-lfs (clean -- %f|smudge -- %f|filter-process)$/;
 export const MAX_AUDIT_BYTES = 5 * 1024 * 1024;
 const MAX_LCS_CELLS = 4_000_000;
@@ -66,9 +69,7 @@ async function gitIn(
   args: string[],
   options: { allowFailure?: boolean; env?: NodeJS.ProcessEnv } = {},
 ): Promise<ExecResult> {
-  // An empty file, because git on Windows cannot open the null device as a config path.
-  const emptyConfig = path.join(os.tmpdir(), "rt-empty-gitconfig");
-  if (!(await pathExists(emptyConfig))) await writeFile(emptyConfig, "");
+  const emptyConfig = await emptyGitConfig();
   const args2 = [
     "--no-replace-objects",
     "-c",
@@ -180,6 +181,23 @@ async function excludeWorktrees(gitDir: string): Promise<void> {
   }
 }
 
+let emptyConfigFile: Promise<string> | undefined;
+
+/**
+ * An empty file, because git on Windows cannot open the null device as a config path. It lives in a
+ * private folder made for this process, so nobody else can leave settings there for git to read.
+ */
+function emptyGitConfig(): Promise<string> {
+  emptyConfigFile ??= (async () => {
+    const folder = await mkdtemp(path.join(os.tmpdir(), "rt-git-"));
+    const file = path.join(folder, "empty-gitconfig");
+    await writeFile(file, "", { flag: "wx" });
+    process.once("exit", () => rmSync(folder, { recursive: true, force: true }));
+    return file;
+  })();
+  return emptyConfigFile;
+}
+
 export interface Workspace {
   path: string;
   branch: string;
@@ -198,6 +216,8 @@ export interface Workspace {
   refs?: Record<string, string>;
   /** The commit built from the reviewed files, once the user has asked for it. */
   commit?: string;
+  /** Saved before the branch moves, so a failure after that can still claim the commit it made. */
+  pendingCommit?: string;
 }
 
 /**
@@ -381,6 +401,10 @@ export interface FileContent {
   binary: boolean;
   tooLarge: boolean;
   addedLines: Set<number>;
+  /** Neither UTF-8 nor marked UTF-16, so the text above is not what a program would read. */
+  undecodable?: boolean;
+  /** Carriage returns with no line feed, which the text above shows as line breaks. */
+  loneCr?: boolean;
 }
 
 export interface WorktreeFile {
@@ -548,6 +572,10 @@ export async function reviewTree(workspace: Workspace): Promise<TreeReview> {
   }
 
   const seen = new Set(pending.map((item) => item.rel));
+  const linkSetting = await gitIn(workspace.gitDir, ["config", "--bool", "core.symlinks"], {
+    allowFailure: true,
+  });
+  const linksFollowed = linkSetting.stdout.trim() !== "false";
   const inspected = await mapLimit(pending, FILE_CONCURRENCY, async ({ rel, symlink }) => {
     const absolute = path.join(workspace.path, rel);
     const buffer = symlink ? Buffer.from(await readlink(absolute)) : await readFile(absolute);
@@ -557,14 +585,14 @@ export async function reviewTree(workspace: Workspace): Promise<TreeReview> {
 
     const known = base.get(rel);
     const binary = isBinary(buffer) || buffer.includes(0);
+    // With core.symlinks off, a checkout holds a link as a plain file of the same text.
+    const sameType = linksFollowed === false || symlink === (known?.mode === "120000");
     const unchanged =
       known !== undefined &&
-      (known.sha === gitBlobSha(buffer) ||
-        // A checkout may hold CRLF for a blob stored with LF. A lone CR is a real edit, though,
-        // because it joins two lines for anything that reads LF.
-        (!binary &&
-          !/\r(?!\n)/.test(buffer.toString("utf8")) &&
-          known.sha === gitBlobSha(Buffer.from(normalizeNewlines(buffer.toString("utf8"))))));
+      sameType &&
+      // A checkout may hold CRLF for a blob stored with LF. A lone CR is a real edit, though,
+      // because it joins two lines for anything that reads LF.
+      (known.sha === gitBlobSha(buffer) || (!binary && known.sha === gitBlobSha(withLineFeeds(buffer))));
     if (unchanged) return { file };
 
     const status: "added" | "modified" = known ? "modified" : "added";
@@ -574,10 +602,14 @@ export async function reviewTree(workspace: Workspace): Promise<TreeReview> {
       const content = { file: rel, status, text: "", binary, tooLarge: true, addedLines: new Set<number>() };
       return { file, change, content };
     }
-    const text = normalizeNewlines(buffer.toString("utf8"));
+    const decoded = decodeText(buffer);
+    const raw = decoded ?? buffer.toString("utf8");
+    const text = normalizeNewlines(raw);
     const before = known ? await showBaseFile(workspace, rel) : null;
     const addedLines = addedLineNumbers(normalizeNewlines(before ?? ""), text);
-    return { file, change, content: { file: rel, status, text, binary, tooLarge: false, addedLines } };
+    const facts = { undecodable: decoded === null, loneCr: /\r(?!\n)/.test(raw) };
+    const content = { file: rel, status, text, binary, tooLarge: false, addedLines, ...facts };
+    return { file, change, content };
   });
   const files = inspected.flatMap((item) => (item.file ? [item.file] : []));
   const changed = inspected.flatMap((item) => (item.change ? [item.change] : []));
@@ -737,16 +769,39 @@ async function commitIdentity(target: string): Promise<NodeJS.ProcessEnv> {
 
 /** CRLF from a Windows checkout becomes LF, as `git add` would do. Files with a lone CR are left alone. */
 function withLineFeeds(buffer: Buffer): Buffer {
-  const text = buffer.toString("utf8");
-  if (isBinary(buffer) || !text.includes("\r\n") || /\r(?!\n)/.test(text)) return buffer;
-  return Buffer.from(normalizeNewlines(text));
+  // One byte per character, so bytes that are not valid UTF-8 come back exactly as they went in.
+  const text = buffer.toString("latin1");
+  if (buffer.includes(0) || !text.includes("\r\n") || /\r(?!\n)/.test(text)) return buffer;
+  return Buffer.from(normalizeNewlines(text), "latin1");
+}
+
+/** Commits the reviewed files and moves the branch to that commit. */
+export async function commitReviewed(
+  target: string,
+  workspace: Workspace,
+  review: TreeReview,
+  message: string,
+  options: { includeRecords: boolean },
+): Promise<string> {
+  const sha = await buildReviewedCommit(target, workspace, review, message, options);
+  await landCommit(workspace, sha);
+  return sha;
+}
+
+/** Moves the branch. The commit exists once this succeeds, so the worktree's index is only tidied after it. */
+export async function landCommit(workspace: Workspace, sha: string): Promise<void> {
+  await gitIn(workspace.gitDir, ["update-ref", `refs/heads/${workspace.branch}`, sha, workspace.baseSha]);
+  if (workspace.adminDir) {
+    const worktreeIndex = { GIT_INDEX_FILE: path.join(workspace.adminDir, "index") };
+    await gitIn(workspace.gitDir, ["read-tree", sha], { env: worktreeIndex, allowFailure: true });
+  }
 }
 
 /**
  * Builds the commit from the exact bytes the review read, in a throwaway index. Nothing in the worktree's
  * own index, filters or hooks takes part, so what merges is what was reviewed.
  */
-export async function commitReviewed(
+export async function buildReviewedCommit(
   target: string,
   workspace: Workspace,
   review: TreeReview,
@@ -783,7 +838,9 @@ export async function commitReviewed(
         throw new TransplantError("stale_review", `${file.path} changed after the report.`);
       }
       const before = base.has(file.path) ? await showBaseFile(workspace, file.path) : null;
-      const bytes = convertsToLf || before?.includes("\r") === false ? withLineFeeds(buffer) : buffer;
+      // Git keeps CR in a file whose stored version already has it, even with autocrlf.
+      const storedWithCr = before?.includes("\r") === true;
+      const bytes = !storedWithCr && (convertsToLf || before !== null) ? withLineFeeds(buffer) : buffer;
       await writeFile(blob, bytes);
       const stored = await gitIn(workspace.gitDir, ["hash-object", "-w", "--no-filters", "--", blob]);
       if (stored.stdout.trim() !== gitBlobSha(bytes)) {
@@ -802,13 +859,7 @@ export async function commitReviewed(
       ["commit-tree", tree, "-p", workspace.baseSha, "-m", message],
       { env: identity },
     );
-    const sha = commit.stdout.trim();
-    await gitIn(workspace.gitDir, ["update-ref", `refs/heads/${workspace.branch}`, sha, workspace.baseSha]);
-    if (workspace.adminDir) {
-      const worktreeIndex = { GIT_INDEX_FILE: path.join(workspace.adminDir, "index") };
-      await gitIn(workspace.gitDir, ["read-tree", sha], { env: worktreeIndex });
-    }
-    return sha;
+    return commit.stdout.trim();
   } finally {
     await rm(index, { force: true }).catch(() => undefined);
     await rm(blob, { force: true }).catch(() => undefined);

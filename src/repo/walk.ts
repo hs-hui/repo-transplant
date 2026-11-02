@@ -108,8 +108,23 @@ const ASSET_EXT = new Set(
 const STYLE_EXT = new Set([".css", ".scss", ".sass", ".less", ".styl"]);
 const CONFIG_EXT = new Set([".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env", ".xml"]);
 const DOC_EXT = new Set([".md", ".mdx", ".rst", ".txt", ".adoc"]);
+const SCRIPT_EXT = new Set(
+  ".sh .bash .zsh .fish .ps1 .psm1 .bat .cmd .c .h .cc .cpp .hpp .lua .pl .pm .r .scala .ex .exs .erl .hs .ml .m .mm".split(
+    " ",
+  ),
+);
 
 export const isLockFile = (rel: string): boolean => LOCK_FILES.has(path.posix.basename(rel));
+
+/** Extensions that promise text, so binary content under one is hiding from the scan. */
+export const isTextExtension = (ext: string): boolean =>
+  ext in LANGUAGE_BY_EXT ||
+  CONFIG_EXT.has(ext) ||
+  DOC_EXT.has(ext) ||
+  STYLE_EXT.has(ext) ||
+  SCRIPT_EXT.has(ext);
+
+export const isAssetExtension = (ext: string): boolean => ASSET_EXT.has(ext);
 
 export function classifyFile(rel: string): FileClass {
   const base = path.posix.basename(rel);
@@ -143,6 +158,9 @@ export interface RepoFile {
   fileClass: FileClass;
 }
 
+/** The most files a snapshot may hold. Larger checkouts are refused, so the walk never cuts one short. */
+export const MAX_SNAPSHOT_FILES = 500_000;
+
 export interface WalkOptions {
   maxFiles?: number;
   /** Include vendored, generated and editor directories, for security and license checks. */
@@ -151,7 +169,7 @@ export interface WalkOptions {
 
 /** Lists regular files using posix relative paths. Symbolic links are never followed. */
 export async function walkRepo(root: string, options: WalkOptions = {}): Promise<RepoFile[]> {
-  const maxFiles = options.maxFiles ?? 200_000;
+  const maxFiles = options.maxFiles ?? MAX_SNAPSHOT_FILES;
   const files: RepoFile[] = [];
   const stack: string[] = [""];
   while (stack.length > 0 && files.length < maxFiles) {

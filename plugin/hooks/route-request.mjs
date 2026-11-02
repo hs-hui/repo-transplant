@@ -1,6 +1,9 @@
 // Skill descriptions are advice, and in testing agents sometimes skipped this one and wrote the
 // feature straight into the checkout. So a request that looks like a transplant gets a reminder.
-const REPOSITORY = /\b(github\.com|gitlab\.com|bitbucket\.org)\/[\w.-]+\/[\w.-]+/i;
+const REPOSITORY = /\b(github\.com|gitlab\.com|bitbucket\.org)[/:][\w.-]+\/[\w.-]+/i;
+// owner/repo alone reads like dark/light or src/app.ts, so the words around it have to say repository.
+const OWNER_REPO =
+  /\bfrom\s+[`'"(]?(?!(?:src|lib|app|apps|tests?|docs?|packages?|scripts?|dist|build|public|components?|pages)\/)[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*|(?:^|\s)[`'"(]?[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*[`'")]?\s*(?:에서|의|레포|저장소|repo\b)/i;
 const INTENT =
   /가져|이식|옮겨|포팅|따와|베껴|넣어|추가해|적용해|참고해|\b(port|transplant|bring|copy|migrate|borrow|lift|reuse|add|same)\b/i;
 
@@ -17,7 +20,7 @@ try {
   // Anything unreadable is not a request this hook understands.
 }
 
-if (REPOSITORY.test(prompt) && INTENT.test(prompt)) {
+if ((REPOSITORY.test(prompt) || OWNER_REPO.test(prompt)) && INTENT.test(prompt)) {
   const hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: REMINDER };
   process.stdout.write(JSON.stringify({ hookSpecificOutput }));
 }

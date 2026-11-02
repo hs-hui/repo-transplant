@@ -51,6 +51,6 @@ Unit tests in a simulated DOM have passed while the real page was wrong. If the 
 3. Add a command with kind `e2e`, such as `npx playwright test --reporter=list`, and set `verification.docker_image` to `mcr.microsoft.com/playwright:v<version>-noble`. Commands run with the network off, so everything the page needs must come from the app or from `verification.services`.
 4. Quote the Playwright test name as the evidence for those criteria.
 
-If the plan may not add packages, install it for the check alone with `npm install --no-save @playwright/test@<version>` in the install command, which leaves `package.json` unchanged, and keep the test folder out of the project's type check.
+If the plan may not add packages, install it for the check alone with `npm install --no-save --ignore-scripts @playwright/test@<version>` in the install command, which leaves `package.json` unchanged, and keep the test folder out of the project's type check.
 
 When comparing with the original, use a deployed demo. Do not run the source locally unless the user approves a sandbox. `visual_compare` is for layout regressions and for matching a reference. A transplant that adopts the target's design is meant to differ from the original.
