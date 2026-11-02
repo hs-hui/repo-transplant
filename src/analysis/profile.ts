@@ -462,7 +462,7 @@ function suggestCommands(
   if (names.has("go.mod")) {
     add("build", "go build ./...", "build");
     add("lint", "go vet ./...", "lint");
-    add("test", "go test ./...", "test");
+    add("test", "go test -v ./...", "test");
   }
   if (names.has("Cargo.toml")) {
     add("typecheck", "cargo check --all-targets", "typecheck");

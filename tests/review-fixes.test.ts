@@ -346,17 +346,22 @@ describe("the prompt hook", () => {
     "bring the editor from acme/widgets.git, please",
     "copy the parser from git@github.com:acme/widgets.git",
     "acme/widgets 에서 로그인 기능 가져와줘",
+    "acme/widgets 에 있는 로그인 기능 가져와줘",
+    "acme/widgets에 있는 기능 이식해줘",
     "add the cache from https://gitlab.com/acme/widgets",
   ])("fires on %s", (prompt) => {
     expect(fires(prompt)).toBe(true);
   });
 
-  it.each(["add a null check to src/server.ts", "copy src/a.ts to src/b.ts", "add ./lib/widgets here"])(
-    "stays quiet on %s",
-    (prompt) => {
-      expect(fires(prompt)).toBe(false);
-    },
-  );
+  it.each([
+    "add a null check to src/server.ts",
+    "copy src/a.ts to src/b.ts",
+    "add ./lib/widgets here",
+    "src/app.ts 에 있는 함수 추가해줘",
+    "components/Button.tsx의 스타일 적용해줘",
+  ])("stays quiet on %s", (prompt) => {
+    expect(fires(prompt)).toBe(false);
+  });
 });
 
 describe("second review: scanner", () => {

@@ -11,7 +11,15 @@ import type { BaselineRun, VerificationRun } from "./store.js";
 import { exportBase, modifiedInRun, RUN_HOME, syncRunDirectory, type Workspace } from "./workspace.js";
 
 const NO_TESTS =
-  /(no test files found|no tests found|no tests ran|collected 0 items|ran 0 tests|running 0 tests|(?<![\d.,])0 passing|(?<![\d.,])0 tests? (run|executed)|^\D*\btests\s+0\s*$|tests?:\s+0 total|\bno test suites? found)/im;
+  /(no test files found|no tests found|no tests ran|collected 0 items|ran 0 tests|running 0 tests|(?<![\d.,])0 passing|(?<![\d.,])0 tests? (run|executed)|^\D*\btests\s+0\s*$|tests?:\s+0 total|\bno test suites? found|no test is available in|no test matches the given testcase filter)/im;
+/**
+ * VSTest's summary for one test project: failed, passed, skipped and total. It is read by position,
+ * because dotnet words it in the machine's language.
+ */
+const DOTNET_SUMMARY =
+  /^\s*[^\n!]+!\s+-\s+[^:,\n]+:\s+(\d+),\s+[^:,\n]+:\s+(\d+),\s+[^:,\n]+:\s+(\d+),\s+[^:,\n]+:\s+(\d+),/gm;
+/** dotnet words its other messages in the machine's language too, so commands run with English output. */
+const ENGLISH_OUTPUT = { DOTNET_CLI_UI_LANGUAGE: "en" };
 /** Summaries where every test was skipped. Exit code 0 here means nothing was proven. */
 const ALL_SKIPPED =
   /^\s*Tests\s+(?:\d+ (?:skipped|todo)(?: \| )?)+ ?\(\d+\)\s*$|^\s*Tests:\s+(?:\d+ (?:skipped|todo),\s*)+\d+ total\s*$|^[\s=]*\d+ (?:skipped|deselected)(?:, \d+ (?:skipped|deselected|xfailed|xpassed))* in [\d.]+/m;
@@ -164,6 +172,17 @@ export function runsInstallScripts(command: string): boolean {
   });
 }
 
+/** Plain `go test` prints the same line for a package whose tests were all skipped and one that passed. */
+export function hidesGoSkips(command: string): boolean {
+  return command.split(/&&|\|\||[;|\n]/).some((step) => {
+    const words = step.trim().split(/\s+/);
+    const at = words.findIndex(
+      (word, index) => /(^|[\\/])go(\.exe)?$/.test(word) && words[index + 1] === "test",
+    );
+    return at !== -1 && !words.slice(at + 2).some((word) => /^--?(v|json|test\.v)(=true)?$/.test(word));
+  });
+}
+
 const SHELL_BUILTIN = /^(cd|echo|test|true|false|export|set|exit|\[|:|if|for|while|then|do|done|fi)$/;
 
 function onPath(tool: string, env: NodeJS.ProcessEnv): boolean {
@@ -222,6 +241,7 @@ export function dockerArgs(
     "/work",
     "-e",
     "CI=1",
+    ...Object.entries(ENGLISH_OUTPUT).flatMap(([key, value]) => ["-e", `${key}=${value}`]),
   ];
   // With every capability dropped, root in a container cannot write to a folder this user owns, and
   // files it did write could not be deleted here. So on Linux and macOS commands run as this user.
@@ -372,7 +392,7 @@ async function runOne(command: Command, context: RunContext): Promise<ExecResult
     await mkdir(context.homeDir, { recursive: true });
     return await exec(command.command, [], {
       cwd: context.runDir,
-      env: { ...scrubbedEnv(process.env, context.homeDir), ...command.env },
+      env: { ...scrubbedEnv(process.env, context.homeDir), ...ENGLISH_OUTPUT, ...command.env },
       shell: true,
       timeoutMs,
       onOutput,
@@ -404,18 +424,21 @@ export function classifyRun(
   // `go test` prints "ok" with [no tests to run] for a package whose filter or test file matched nothing.
   const goRan = /^ok\s(?!.*\[no tests to run\])/m.test(plain);
   const goWithoutTests = /\[no test files\]|\[no tests to run\]/.test(plain) && !goRan;
+  const dotnetPassed = [...plain.matchAll(DOTNET_SUMMARY)].map((match) => Number(match[2]));
+  const ran = SOME_TESTS_RAN.test(plain) || dotnetPassed.some((count) => count > 0);
   // Cargo prints "running 0 tests" for each target without tests, beside the ones that have them.
-  const noTests = NO_TESTS.test(plain) && !SOME_TESTS_RAN.test(plain);
+  const noTests = NO_TESTS.test(plain) && !ran;
   const cargoResults = plain.match(/^test result: .*$/gm) ?? [];
   const cargoNonePassed = cargoResults.length > 0 && cargoResults.every((line) => /\b0 passed\b/.test(line));
+  const dotnetNonePassed = dotnetPassed.length > 0 && !ran;
   const goSkipped = /^\s*--- SKIP: /m.test(plain) && !/^\s*--- PASS: /m.test(plain);
   const unittest = plain.match(/^Ran (\d+) tests? in [\s\S]*?^OK \(skipped=(\d+)\)\s*$/m);
   const unittestSkipped = unittest !== null && unittest[1] === unittest[2];
   const skipped =
-    goSkipped ||
-    unittestSkipped ||
-    (!SOME_TESTS_RAN.test(plain) && (ALL_SKIPPED.test(plain) || NODE_NONE_PASSED.test(plain)));
-  return noTests || goWithoutTests || cargoNonePassed || skipped ? "no_tests_ran" : "passed";
+    goSkipped || unittestSkipped || (!ran && (ALL_SKIPPED.test(plain) || NODE_NONE_PASSED.test(plain)));
+  return noTests || goWithoutTests || cargoNonePassed || dotnetNonePassed || skipped
+    ? "no_tests_ran"
+    : "passed";
 }
 
 export const stripAnsi = (text: string): string => text.replace(ANSI, "");
@@ -425,6 +448,8 @@ const FAILURE_LINES = [
   /^FAILED (\S+)/gm,
   /^\s*FAIL\s+(.+ > .+?)\s*$/gm,
   /^\s*[×✕✗✖]\s+(.+?)(?:\s+\(?\d+(?:\.\d+)?\s*m?s\)?)?\s*$/gm,
+  // VSTest, in English because commands run with ENGLISH_OUTPUT. Theory names hold spaces.
+  /^\s+Failed (.+?) \[[^\]\n]*\]\s*$/gm,
   // Failures that are not a single test. Missing one of these would let a new one pass as old.
   /^ERROR (\S+\.\w\S*)/gm,
   /^FAIL\s+(\S+)\s+\[(?:build|setup) failed\]/gm,
@@ -451,11 +476,39 @@ function goFailures(plain: string): string[] {
   return [...names, ...pending];
 }
 
+/**
+ * Cargo names a failure by its path inside one test target, and the crates of a workspace print the same
+ * target paths. The rerun hint after each failed target names it, so names are qualified with that.
+ */
+function cargoFailures(plain: string): string[] {
+  const names: string[] = [];
+  let pending: string[] = [];
+  let target = "";
+  const settle = (qualifier: string): void => {
+    names.push(...pending.map((name) => (qualifier ? `${qualifier}: ${name}` : name)));
+    pending = [];
+  };
+  for (const line of plain.split("\n")) {
+    const running = line.match(/^\s*(?:Running (?:unittests )?(\S+)|Doc-tests (\S+))/);
+    if (running) {
+      settle(target);
+      target = running[1] ? running[1].replaceAll("\\", "/") : `doc-tests ${running[2]}`;
+    }
+    const failed = line.match(/^test (.+?) \.\.\. FAILED\s*$/);
+    if (failed) pending.push(failed[1]!.replaceAll("\\", "/"));
+    const rerun = line.match(/^error: (?:test|doctest) failed, to rerun pass `([^`]*)`/);
+    if (rerun) settle(rerun[1]!);
+  }
+  settle(target);
+  return names;
+}
+
 /** Test names a runner reports as failed. An empty list means the output could not be read that way. */
 export function failingTests(output: string): string[] {
   const plain = stripAnsi(output);
   const names = [
     ...goFailures(plain),
+    ...cargoFailures(plain),
     ...FAILURE_LINES.flatMap((pattern) => [...plain.matchAll(pattern)].map((match) => match[1]!)),
   ].map(sanitizeDisplay);
   const tests = names.filter((name) => name !== "failing tests:");
