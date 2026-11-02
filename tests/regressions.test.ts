@@ -1910,11 +1910,22 @@ describe("telling old failures from new ones", () => {
 
   it("calls out a test command that runs only part of the suite", async () => {
     const plan = planWith({
-      verification: { commands: [{ name: "unit", command: "go test -run Gzip ./...", kind: "test" }] },
+      verification: { commands: [{ name: "unit", command: "go test -v -run Gzip ./...", kind: "test" }] },
     });
     const { id } = await workspaceFor(plan);
     const session = await loadSession(config, id);
-    expect(approvalSummary(session)).toContain("Runs only part of the test suite: go test -run Gzip ./...");
+    expect(approvalSummary(session)).toContain(
+      "Runs only part of the test suite: go test -v -run Gzip ./...",
+    );
+  });
+
+  it("refuses go test that would hide skipped packages", async () => {
+    const plan = planWith({
+      verification: { commands: [{ name: "unit", command: "go test ./...", kind: "test" }] },
+    });
+    const error = await workspaceFor(plan).catch((failure) => failure);
+    expect(error).toMatchObject({ code: "invalid_plan" });
+    expect(JSON.stringify(error)).toContain("unit runs go test without -v");
   });
 });
 

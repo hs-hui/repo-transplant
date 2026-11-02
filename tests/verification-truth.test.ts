@@ -3,7 +3,9 @@ import { EvidenceInput, TransplantPlan } from "../src/session/schema.js";
 import {
   assertLocalEnv,
   classifyRun,
+  dockerArgs,
   failingTests,
+  hidesGoSkips,
   runsInstallScripts,
   startServices,
   stopContainers,
@@ -50,6 +52,22 @@ describe("a run that tested nothing does not pass", () => {
     ["output in colour", "\u001b[2m      Tests  \u001b[22m2 skipped (2)\n"],
     ["go -v with everything skipped", "=== RUN TestA\n--- SKIP: TestA (0.00s)\nPASS\nok  \tpkg\t0.1s\n"],
     ["unittest with everything skipped", "ss\nRan 2 tests in 0.001s\n\nOK (skipped=2)\n"],
+    [
+      "dotnet with everything skipped",
+      "Skipped! - Failed:     0, Passed:     0, Skipped:     2, Total:     2, Duration: 7 ms - Probe.dll (net10.0)\n",
+    ],
+    [
+      "dotnet in Korean with everything skipped",
+      "건너뜀! - 실패:     0, 통과:     0, 건너뜀:     2, 전체:     2, 기간: 7 ms - Probe.dll (net10.0)\r\n",
+    ],
+    [
+      "dotnet with no tests",
+      "A total of 1 test files matched the specified pattern.\nNo test is available in C:\\p\\bin\\Debug\\net10.0\\Probe.dll. Make sure that test discoverer & executors are registered and platform & framework version settings are appropriate and try again.\n",
+    ],
+    [
+      "dotnet with a filter that matched nothing",
+      "No test matches the given testcase filter `Name=X` in C:\\p\\Probe.dll\n",
+    ],
   ])("%s", (_label, output) => {
     expect(classifyRun(command(), clean, output, false)).toBe("no_tests_ran");
   });
@@ -70,6 +88,18 @@ describe("a run that tested nothing does not pass", () => {
     [
       "cargo with one target empty",
       "test result: ok. 0 passed; 0 failed\ntest result: ok. 4 passed; 0 failed\n",
+    ],
+    [
+      "dotnet in Korean with a pass",
+      "통과!  - 실패:     0, 통과:     1, 건너뜀:     1, 전체:     2, 기간: 7 ms - Probe.dll (net10.0)\n",
+    ],
+    [
+      "dotnet, one project skipped and one passed",
+      "Skipped! - Failed:     0, Passed:     0, Skipped:     2, Total:     2, Duration: 7 ms - A.dll (net10.0)\nPassed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3, Duration: 9 ms - B.dll (net10.0)\n",
+    ],
+    [
+      "dotnet, one project with no tests and one passed",
+      "No test is available in C:\\p\\A.dll.\nPassed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3, Duration: 9 ms - B.dll (net10.0)\n",
     ],
   ])("still passes %s", (_label, output) => {
     expect(classifyRun(command(), clean, output, false)).toBe("passed");
@@ -102,6 +132,77 @@ describe("Go failures carry their package", () => {
 
   it("does not read a cached or subtest failure wrongly", () => {
     expect(failingTests("    --- FAIL: TestA/sub (0.00s)\nFAIL\tpkg\t(cached)\n")).toEqual(["pkg/TestA/sub"]);
+  });
+});
+
+describe("Cargo failures carry their target", () => {
+  // Real output of `cargo test --workspace --no-fail-fast` on Windows. Both crates print the same paths.
+  const target = (crate: string, running: string, test: string, rerun: string): string =>
+    `     Running ${running} (target\\debug\\deps\\${crate}-7b5a9ff8b879b52a.exe)\r\n\r\nrunning 1 test\r\ntest ${test} ... FAILED\r\n\r\nfailures:\r\n\r\nfailures:\r\n    ${test}\r\n\r\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\nerror: test failed, to rerun pass \`${rerun}\`\r\n`;
+  const doctests = (crate: string): string =>
+    `   Doc-tests ${crate}\r\n\r\nrunning 1 test\r\ntest crates\\${crate}\\src\\lib.rs - f (line 1) ... FAILED\r\n\r\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s\r\n\r\nerror: doctest failed, to rerun pass \`-p ${crate} --doc\`\r\n`;
+
+  it("tells the crates of a workspace apart", () => {
+    const log = ["a", "b"]
+      .map(
+        (crate) =>
+          target(crate, "unittests src\\lib.rs", "t::same", `-p ${crate} --lib`) +
+          target("api", "tests\\api.rs", "same", `-p ${crate} --test api`),
+      )
+      .concat(doctests("a"), doctests("b"))
+      .join("");
+    expect(failingTests(log)).toEqual(
+      [
+        "-p a --lib: t::same",
+        "-p a --test api: same",
+        "-p a --doc: crates/a/src/lib.rs - f (line 1)",
+        "-p b --lib: t::same",
+        "-p b --test api: same",
+        "-p b --doc: crates/b/src/lib.rs - f (line 1)",
+      ].sort(),
+    );
+  });
+
+  it("falls back to the target when no rerun hint follows", () => {
+    expect(failingTests("     Running unittests src\\lib.rs (x.exe)\ntest t::a ... FAILED\n")).toEqual([
+      "src/lib.rs: t::a",
+    ]);
+    expect(failingTests("test t::a ... FAILED\n")).toEqual(["t::a"]);
+  });
+});
+
+describe("dotnet failures", () => {
+  it("reads VSTest's failed tests, theories included", () => {
+    const log =
+      '  Failed Probe.Tests.A [1 ms]\r\n  Error Message:\r\n   Assert.True() Failure\r\n  Failed Probe.Tests.T(x: 1, name: "a b") [< 1 ms]\r\nFailed!  - Failed:     2, Passed:     1, Skipped:     0, Total:     3, Duration: 13 ms - Probe.dll (net10.0)\r\n';
+    expect(failingTests(log)).toEqual(["Probe.Tests.A", 'Probe.Tests.T(x: 1, name: "a b")']);
+  });
+});
+
+describe("go test without -v", () => {
+  it.each(["go test ./...", "go test -run TestX ./pkg", "cd svc && go test ./...", "go test -v=false ./..."])(
+    "%s hides skips",
+    (text) => {
+      expect(hidesGoSkips(text)).toBe(true);
+    },
+  );
+
+  it.each([
+    "go test -v ./...",
+    "go test ./... -json",
+    "go vet ./...",
+    "go build ./... && go test -v ./...",
+    "gotestsum",
+  ])("%s does not", (text) => {
+    expect(hidesGoSkips(text)).toBe(false);
+  });
+});
+
+describe("runner output language", () => {
+  it("asks dotnet for English in a container", () => {
+    expect(dockerArgs("mcr.microsoft.com/dotnet/sdk:10.0", "/w", command()).join(" ")).toContain(
+      "-e DOTNET_CLI_UI_LANGUAGE=en",
+    );
   });
 });
 

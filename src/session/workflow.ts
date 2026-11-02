@@ -33,6 +33,7 @@ import {
 } from "./store.js";
 import {
   assertLocalEnv,
+  hidesGoSkips,
   narrowedChecks,
   needsBrowserCheck,
   runBaseline,
@@ -355,6 +356,11 @@ function validatePlan(plan: TransplantPlan, spec: FeatureSpec): string[] {
     if (runsInstallScripts(command.command) && !plan.verification.install_scripts_reason) {
       problems.push(
         `${command.name} runs package install scripts. Add --ignore-scripts, or set install_scripts_reason.`,
+      );
+    }
+    if ((command.kind === "test" || command.kind === "e2e") && hidesGoSkips(command.command)) {
+      problems.push(
+        `${command.name} runs go test without -v. Go then prints the same line for a package whose tests were all skipped and one that passed, so add -v.`,
       );
     }
     try {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.3
+
+Found by feeding real go, cargo, dotnet, Python and Node runner output to the checks.
+
+- A test command that runs `go test` needs `-v`. Plain `go test` prints the same line for a package whose tests were all skipped and one that passed. `repo_profile` suggests `go test -v ./...`.
+- A `dotnet test` run where every test was skipped, there were no tests, or the filter matched nothing no longer passes. The summary is read in any language, and commands run with `DOTNET_CLI_UI_LANGUAGE=en`.
+- Cargo and VSTest failures are named, so a failure the base already has can be told from a new one. Cargo names carry the rerun hint of their target, which tells the crates of a workspace apart.
+- The prompt hook recognizes `owner/repo 에 있는`, and reads `src/app.ts의` as a path, not a repository.
+
 ## 1.0.2
 
 - The gates no longer depend on the trace alone. The whole-repository scan is kept for the session, and a flagged file the plan leaves out needs `out_of_scope_reason`, shown at approval and in the report.
