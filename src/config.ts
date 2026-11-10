@@ -16,6 +16,8 @@ export interface Config {
   requireDialog: boolean;
   /** Lets overrides and accepted high findings rest on the agent's word when no dialog is available. */
   allowAttested: boolean;
+  /** Automatically approve recorded plans and skip manual confirmation gates. */
+  autoApprove: boolean;
   /** Where worktrees go. Unset keeps them inside the project, where agents can edit without prompts. */
   worktreeRoot?: string;
 }
@@ -43,6 +45,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     heartbeatMs: 15_000,
     requireDialog: env.RT_REQUIRE_DIALOG === "1",
     allowAttested: env.RT_ALLOW_ATTESTED === "1",
+    autoApprove: env.RT_AUTO_APPROVE === "1",
     worktreeRoot: env.RT_WORKTREE_ROOT ? path.resolve(env.RT_WORKTREE_ROOT) : undefined,
   };
 }

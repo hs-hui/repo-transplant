@@ -69,10 +69,37 @@ claude plugin install repo-transplant@repo-transplant
 
 Then ask in plain words, or run `/repo-transplant:transplant <url> <feature>`.
 
-### As an MCP server only
+### As an MCP server (Claude Code, Codex, OpenCode, Cursor, Windsurf)
 
-For any MCP client:
+Works with any coding agent supporting the Model Context Protocol (MCP).
 
+#### Codex
+```bash
+codex mcp add repo-transplant -- npx -y repo-transplant-mcp
+```
+Or in `~/.codex/config.json`:
+```json
+{
+  "mcpServers": {
+    "repo-transplant": { "command": "npx", "args": ["-y", "repo-transplant-mcp"] }
+  }
+}
+```
+
+#### OpenCode
+```bash
+opencode mcp add repo-transplant npx -y repo-transplant-mcp
+```
+Or in `opencode.json`:
+```json
+{
+  "mcp": {
+    "repo-transplant": { "command": "npx", "args": ["-y", "repo-transplant-mcp"] }
+  }
+}
+```
+
+#### Claude Code & other MCP clients (Cursor, Windsurf, Claude Desktop)
 ```bash
 claude mcp add repo-transplant -- npx -y repo-transplant-mcp
 ```
@@ -86,6 +113,14 @@ claude mcp add repo-transplant -- npx -y repo-transplant-mcp
 ```
 
 The server carries its workflow in its instructions and offers a `transplant` prompt. The skill's playbooks for backend, UI and cross-framework work are plugin-only.
+
+### Autonomous / Auto-Approve mode ("계속 진행해")
+
+By default, Repo Transplant asks the user to review and approve the plan before opening the worktree. When you tell the agent "계속 진행해" (keep going), "build it", or ask for autonomous execution:
+
+- Pass `auto_approve: true` in `transplant_record_plan` or `transplant_create_workspace`.
+- Or set environment variable `RT_AUTO_APPROVE=1`.
+- The session automatically advances to `approved` and builds the workspace without stopping for manual dialog approval.
 
 ## How a transplant runs
 

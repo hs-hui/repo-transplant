@@ -87,6 +87,7 @@ export interface Session {
   spec?: FeatureSpec;
   plan?: TransplantPlan;
   planHash?: string;
+  autoApprove?: boolean;
   approval?: {
     at: string;
     via: "elicitation" | "agent_attested";
