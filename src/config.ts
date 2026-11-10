@@ -44,7 +44,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxOutputChars: positiveInt(env.RT_MAX_OUTPUT_CHARS, 60_000),
     heartbeatMs: 15_000,
     requireDialog: env.RT_REQUIRE_DIALOG === "1",
-    allowAttested: env.RT_ALLOW_ATTESTED !== "0",
+    allowAttested: env.RT_ALLOW_ATTESTED === "1",
     autoApprove: env.RT_AUTO_APPROVE === "1",
     worktreeRoot: env.RT_WORKTREE_ROOT ? path.resolve(env.RT_WORKTREE_ROOT) : undefined,
   };

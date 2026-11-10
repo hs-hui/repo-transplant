@@ -43871,7 +43871,7 @@ function loadConfig(env = process.env) {
     maxOutputChars: positiveInt(env.RT_MAX_OUTPUT_CHARS, 6e4),
     heartbeatMs: 15e3,
     requireDialog: env.RT_REQUIRE_DIALOG === "1",
-    allowAttested: env.RT_ALLOW_ATTESTED !== "0",
+    allowAttested: env.RT_ALLOW_ATTESTED === "1",
     autoApprove: env.RT_AUTO_APPROVE === "1",
     worktreeRoot: env.RT_WORKTREE_ROOT ? path12.resolve(env.RT_WORKTREE_ROOT) : void 0
   };
@@ -47245,7 +47245,7 @@ Not found on this machine: ${missing.join(", ")}. Checks that use them will fail
       let overrides = [
         license_override && `License override: ${license_override}`,
         security_override && `Security override: ${security_override}`
-      ].filter(Boolean), isAuto = auto_approve || session.autoApprove || user_confirmation?.trim().toLowerCase().includes("auto") || user_confirmation?.trim().includes("\uACC4\uC18D \uC9C4\uD589") || user_confirmation?.trim().includes("\uC9C4\uD589\uD574"), asked = isAuto ? "agent_attested" : await askUser(
+      ].filter(Boolean), isAuto = !!(auto_approve || session.autoApprove) || !!(user_confirmation?.trim().toLowerCase().includes("auto") || user_confirmation?.trim().includes("\uACC4\uC18D \uC9C4\uD589") || user_confirmation?.trim().includes("\uC9C4\uD589\uD574")), asked = isAuto ? null : await askUser(
         ["Approve this transplant?", "", approvalSummary(session), "", ...overrides].join(`
 `),
         signal

@@ -713,13 +713,14 @@ export function createServer(config: Config = loadConfig()): McpServer {
         security_override && `Security override: ${security_override}`,
       ].filter(Boolean);
       const isAuto =
-        auto_approve ||
-        session.autoApprove ||
-        user_confirmation?.trim().toLowerCase().includes("auto") ||
-        user_confirmation?.trim().includes("계속 진행") ||
-        user_confirmation?.trim().includes("진행해");
+        Boolean(auto_approve || session.autoApprove) ||
+        Boolean(
+          user_confirmation?.trim().toLowerCase().includes("auto") ||
+            user_confirmation?.trim().includes("계속 진행") ||
+            user_confirmation?.trim().includes("진행해"),
+        );
       const asked = isAuto
-        ? "agent_attested"
+        ? null
         : await askUser(
             ["Approve this transplant?", "", approvalSummary(session), "", ...overrides].join("\n"),
             signal,
