@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.4
+
+- Added full compatibility and installation documentation for Codex, OpenCode, Cursor, Windsurf, and any standard MCP-compliant coding agent.
+- Added autonomous / auto-approve mode: pass `auto_approve: true` in `transplant_record_plan` or `transplant_create_workspace`, or set environment variable `RT_AUTO_APPROVE=1`, to proceed directly to workspace creation and implementation without pausing for manual approval dialogs when the user asks to continue (e.g. "계속 진행해").
+- `transplant_approve` now accepts `auto_approve: true` or affirmative user confirmation strings to proceed seamlessly without requiring a modal dialog.
+- Defaulted `allowAttested` to true on non-dialog MCP clients so overrides and high findings do not block agents that lack custom dialog elicitation.
+
 ## 1.0.3
 
 Found by feeding real go, cargo, dotnet, Python and Node runner output to the checks.

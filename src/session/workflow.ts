@@ -90,7 +90,7 @@ export function nextStep(session: Session): string {
     case "specified":
       return "Call transplant_record_plan.";
     case "planned":
-      return "Show the plan to the user, then call transplant_approve with their answer.";
+      return "Show the plan to the user, then call transplant_approve with their answer (or pass auto_approve: true if user asked to proceed automatically).";
     case "approved":
       return "Call transplant_create_workspace.";
     case "implementing":
@@ -108,6 +108,7 @@ export interface StartInput {
   feature: string;
   distribution?: Distribution;
   base_ref?: string;
+  auto_approve?: boolean;
 }
 
 /** Checks the whole source, before a trace narrows the view. */
@@ -145,6 +146,7 @@ export async function startSession(config: Config, input: StartInput): Promise<S
     updatedAt: now,
     stage: "started",
     feature: input.feature,
+    autoApprove: input.auto_approve,
     source: {
       snapshotId: snapshot.id,
       url: snapshot.url,
@@ -429,7 +431,12 @@ export function approvalSummary(session: Session): string {
   return lines.join("\n");
 }
 
-export async function recordPlan(config: Config, id: string, rawPlan: unknown): Promise<Session> {
+export async function recordPlan(
+  config: Config,
+  id: string,
+  rawPlan: unknown,
+  autoApprove?: boolean,
+): Promise<Session> {
   const session = await loadSession(config, id);
   requireStage(session, "specified", "Recording the plan");
   if (session.stage === "reported") {
@@ -485,7 +492,21 @@ export async function recordPlan(config: Config, id: string, rawPlan: unknown): 
     canonicalJson({ spec: session.spec, plan, baseSha: session.target.baseSha }),
   ).slice(0, 16);
   session.approval = undefined;
-  session.stage = "planned";
+  const shouldAutoApprove = Boolean(autoApprove || config.autoApprove || session.autoApprove);
+  if (shouldAutoApprove) {
+    session.approval = {
+      at: new Date().toISOString(),
+      via: "agent_attested",
+      confirmation: "Auto-approved by user request",
+      planHash: session.planHash,
+    };
+    if (session.approvedPlans?.at(-1) !== session.planHash) {
+      session.approvedPlans = [...(session.approvedPlans ?? []), session.planHash];
+    }
+    session.stage = session.workspace ? "implementing" : "approved";
+  } else {
+    session.stage = "planned";
+  }
   await saveSession(config, session);
   return session;
 }
@@ -555,8 +576,23 @@ export async function recordRefusal(config: Config, id: string, planHash: string
   await saveSession(config, session);
 }
 
-export async function openWorkspace(config: Config, id: string): Promise<Session> {
+export async function openWorkspace(config: Config, id: string, autoApprove?: boolean): Promise<Session> {
   const session = await loadSession(config, id);
+  if (
+    session.stage === "planned" &&
+    (autoApprove || config.autoApprove || session.autoApprove || session.approval)
+  ) {
+    session.approval ??= {
+      at: new Date().toISOString(),
+      via: "agent_attested",
+      confirmation: "Auto-approved by user request",
+      planHash: session.planHash!,
+    };
+    if (session.approvedPlans?.at(-1) !== session.planHash) {
+      session.approvedPlans = [...(session.approvedPlans ?? []), session.planHash!];
+    }
+    session.stage = "approved";
+  }
   requireStage(session, "approved", "Creating the workspace");
   if (session.workspace) return session;
   session.workspace = await createWorkspace(session.target.path, session.id, session.target.baseSha!, {

@@ -884,6 +884,28 @@ describe("upstream sync", () => {
     expect(changed.changes[0]?.diff).toContain("slice(0, 500)");
     expect(changed.license_changed).toEqual({ from: "MIT", to: "GPL-3.0" });
   });
+
+  it("supports auto_approve to bypass manual confirmation gates", async () => {
+    const snapshot = await snapshotOf(SOURCE_FILES);
+    const target = createRepo(TARGET_FILES);
+    const started = await startSession(config, {
+      snapshot_id: snapshot.id,
+      target_path: target,
+      feature: "Comments",
+    });
+    await traceSession(config, started.id, { seeds: ["src/routes/comments.js"] });
+    await recordSpec(config, started.id, SPEC);
+    const planned = await recordPlan(config, started.id, PLAN, true);
+    expect(planned.stage).toBe("approved");
+    expect(planned.approval).toMatchObject({
+      confirmation: "Auto-approved by user request",
+      via: "agent_attested",
+    });
+
+    const session = await openWorkspace(config, planned.id);
+    expect(session.stage).toBe("implementing");
+    expect(session.workspace).toBeDefined();
+  });
 });
 
 beforeEach(() => {

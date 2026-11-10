@@ -69,10 +69,37 @@ claude plugin install repo-transplant@repo-transplant
 
 이후 평소처럼 말하거나 `/repo-transplant:transplant <url> <기능>`을 실행하면 됩니다.
 
-### MCP 서버만 사용
+### MCP 서버만 사용 (Claude Code, Codex, OpenCode, Cursor, Windsurf)
 
 MCP를 지원하는 모든 클라이언트에서 쓸 수 있습니다.
 
+#### Codex
+```bash
+codex mcp add repo-transplant -- npx -y repo-transplant-mcp
+```
+또는 `~/.codex/config.json`:
+```json
+{
+  "mcpServers": {
+    "repo-transplant": { "command": "npx", "args": ["-y", "repo-transplant-mcp"] }
+  }
+}
+```
+
+#### OpenCode
+```bash
+opencode mcp add repo-transplant npx -y repo-transplant-mcp
+```
+또는 `opencode.json`:
+```json
+{
+  "mcp": {
+    "repo-transplant": { "command": "npx", "args": ["-y", "repo-transplant-mcp"] }
+  }
+}
+```
+
+#### Claude Code 및 기타 MCP 클라이언트 (Cursor, Windsurf, Claude Desktop)
 ```bash
 claude mcp add repo-transplant -- npx -y repo-transplant-mcp
 ```
@@ -86,6 +113,14 @@ claude mcp add repo-transplant -- npx -y repo-transplant-mcp
 ```
 
 서버 자체에 작업 절차가 포함돼 있고 `transplant` 프롬프트도 제공합니다. 백엔드, UI, 프레임워크 간 이식 플레이북은 플러그인에만 있습니다.
+
+### 자율 진행 / 계획 자동 승인 모드 ("계속 진행해")
+
+기본적으로 Repo Transplant는 계획을 기록한 뒤 사용자에게 승인을 묻습니다. 사용자가 **"계속 진행해"** 또는 **"알아서 구축해줘"**라고 요청할 경우:
+
+- `transplant_record_plan` 또는 `transplant_create_workspace` 호출 시 `auto_approve: true`를 넘기거나,
+- 환경 변수 `RT_AUTO_APPROVE=1`을 설정해 두면 됩니다.
+- 별도의 대화창 승인 대기 없이 바로 승인 단계(`approved`)로 넘어가 작업 공간(`workspace`)을 생성하고 구현을 계속 진행합니다.
 
 ## 이식 절차
 
